@@ -107170,6 +107170,8 @@ async function loginToIs(user2, pass2, fetchImpl) {
 const IS_HOST = "is.mendelu.cz";
 const LOGIN_FLOOR_MS = 6e4;
 const MAX_UNEXPECTED = 3;
+const NO_LOGIN_MESSAGE = "No IS Mendelu login is set yet. In Claude Code, run /plugin configure reis and enter your IS username and password. In Claude Desktop, open the reIS for Claude extension settings.";
+const noLoginFetch = () => Promise.reject(new Error(NO_LOGIN_MESSAGE));
 function urlOf(input) {
   return typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
 }
@@ -107228,7 +107230,7 @@ function createIsSession(creds, nativeFetch2, now = Date.now) {
     headers2.cookie = c;
     return nativeFetch2(input, { ...init, headers: headers2 });
   };
-  const sessionFetch = async (input, init = {}) => {
+  const sessionFetch2 = async (input, init = {}) => {
     let url2 = null;
     try {
       url2 = new URL(urlOf(input));
@@ -107253,7 +107255,7 @@ function createIsSession(creds, nativeFetch2, now = Date.now) {
     }
     return retry;
   };
-  return { fetch: sessionFetch };
+  return { fetch: sessionFetch2 };
 }
 const instanceOfAny = (object2, constructors) => constructors.some((c) => object2 instanceof c);
 let idbProxyableTypes;
@@ -111605,7 +111607,10 @@ function handoverResult({ handover: h }) {
   const mb = (h.bytes / 1024 / 1024).toFixed(1);
   return {
     content: [
-      { type: "text", text: `IS file ${h.filename} (${h.mimeType}, ${mb} MB), attached.` },
+      {
+        type: "text",
+        text: `IS file ${h.filename} (${h.mimeType}, ${mb} MB), attached. Read the saved copy to see its content.`
+      },
       {
         type: "resource",
         resource: {
@@ -111635,6 +111640,7 @@ function registerTools(server2, ctx) {
         annotations: READ_ONLY
       },
       async (args) => {
+        if (ctx.unavailable) return toError(t.name, new Error(ctx.unavailable));
         try {
           return toolResult(
             await t.run(args, ctx),
@@ -111649,16 +111655,15 @@ function registerTools(server2, ctx) {
 }
 const user = process.env.MENDELU_USER?.trim();
 const pass = process.env.MENDELU_PASS;
-if (!user || !pass) {
-  process.stderr.write(
-    "reIS for Claude: set your IS Mendelu username and password in the extension settings.\n"
-  );
-  process.exit(1);
-}
-const session = createIsSession({ user, pass }, nativeFetch);
-setSessionFetch(session.fetch);
+const sessionFetch = user && pass ? createIsSession({ user, pass }, nativeFetch).fetch : noLoginFetch;
+if (sessionFetch === noLoginFetch) process.stderr.write(`reIS for Claude: ${NO_LOGIN_MESSAGE}
+`);
+setSessionFetch(sessionFetch);
 const server = new McpServer({ name: "reis-mendelu", version: "0.1.3" });
-registerTools(server, { fetch: session.fetch });
+registerTools(server, {
+  fetch: sessionFetch,
+  ...sessionFetch === noLoginFetch ? { unavailable: NO_LOGIN_MESSAGE } : {}
+});
 server.connect(new StdioServerTransport()).catch((e) => {
   process.stderr.write(
     `reIS for Claude: could not start (${e instanceof Error ? e.message : String(e)}).
