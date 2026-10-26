@@ -7,7 +7,10 @@
     "name": "reIS",
     "url": "https://github.com/reis-mendelu/reis-extension"
   },
-  "homepage": "https://github.com/reis-mendelu/reis-extension/tree/main/mcp",
+  "homepage": "https://github.com/reis-mendelu/reis-for-claude",
+  "documentationUrl": "https://github.com/reis-mendelu/reis-for-claude#readme",
+  "privacyPolicyUrl": "https://github.com/reis-mendelu/reis-for-claude/blob/main/PRIVACY.md",
+  "supportUrl": "https://github.com/reis-mendelu/reis-for-claude/issues",
   "repository": "https://github.com/reis-mendelu/reis-extension",
   "license": "Apache-2.0",
   "keywords": [
