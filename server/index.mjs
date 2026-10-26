@@ -111214,12 +111214,14 @@ const MIME_BY_EXT = {
   ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
   ".odt": "application/vnd.oasis.opendocument.text"
 };
+const GENERIC_TYPES = /^(application\/(octet-stream|zip|x-zip(-compressed)?|download|force-download|x-download)|binary\/octet-stream)$/;
 async function documentResult(bytes, meta) {
-  const generic = !meta.mediaType || meta.mediaType === "application/octet-stream";
+  const generic = !meta.mediaType || GENERIC_TYPES.test(meta.mediaType);
+  const mimeType2 = generic ? MIME_BY_EXT[meta.ext] ?? meta.mediaType : meta.mediaType;
   return {
     handover: {
       filename: meta.filename ?? `file${meta.ext}`,
-      mimeType: (generic ? MIME_BY_EXT[meta.ext] : meta.mediaType) ?? "application/octet-stream",
+      mimeType: mimeType2 || "application/octet-stream",
       base64: Buffer.from(bytes).toString("base64"),
       bytes: bytes.byteLength
     }
