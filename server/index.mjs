@@ -18,6 +18,10 @@ import { PerformanceObserver, PerformanceEntry } from "node:perf_hooks";
 import require$$0$1 from "events";
 import require$$4 from "tls";
 import process$1 from "node:process";
+import { createHash, randomBytes } from "node:crypto";
+import { homedir } from "node:os";
+import path from "node:path";
+import * as realFs from "node:fs/promises";
 const messages = {
   AbortError: "A request was aborted, for example through a call to IDBTransaction.abort.",
   ConstraintError: "A mutation operation in the transaction failed because a constraint was not satisfied. For example, an object such as an object store or index already exists and a request attempted to create a new one.",
@@ -189,12 +193,7 @@ const getType = (x3) => {
   }
   throw new DataError();
 };
-const cmp = (first, second) => {
-  if (second === void 0) {
-    throw new TypeError();
-  }
-  first = valueToKey(first);
-  second = valueToKey(second);
+const cmpKeys = (first, second) => {
   const t1 = getType(first);
   const t2 = getType(second);
   if (t1 !== t2) {
@@ -213,13 +212,31 @@ const cmp = (first, second) => {
     return -1;
   }
   if (t1 === "Binary") {
-    first = new Uint8Array(first);
-    second = new Uint8Array(second);
+    const firstBytes = new Uint8Array(first);
+    const secondBytes = new Uint8Array(second);
+    const firstLen = firstBytes.length;
+    const secondLen = secondBytes.length;
+    const length = Math.min(firstLen, secondLen);
+    for (let i = 0; i < length; i++) {
+      if (firstBytes[i] > secondBytes[i]) {
+        return 1;
+      }
+      if (firstBytes[i] < secondBytes[i]) {
+        return -1;
+      }
+    }
+    if (firstLen > secondLen) {
+      return 1;
+    }
+    if (firstLen < secondLen) {
+      return -1;
+    }
+    return 0;
   }
-  if (t1 === "Array" || t1 === "Binary") {
+  if (t1 === "Array") {
     const length = Math.min(first.length, second.length);
     for (let i = 0; i < length; i++) {
-      const result2 = cmp(first[i], second[i]);
+      const result2 = cmpKeys(first[i], second[i]);
       if (result2 !== 0) {
         return result2;
       }
@@ -242,6 +259,12 @@ const cmp = (first, second) => {
     }
   }
   return first > second ? 1 : -1;
+};
+const cmp = (first, second) => {
+  if (second === void 0) {
+    throw new TypeError();
+  }
+  return cmpKeys(valueToKey(first), valueToKey(second));
 };
 class FDBKeyRange {
   static only(value2) {
@@ -269,12 +292,12 @@ class FDBKeyRange {
     if (arguments.length < 2) {
       throw new TypeError();
     }
-    const cmpResult = cmp(lower, upper);
+    lower = valueToKey(lower);
+    upper = valueToKey(upper);
+    const cmpResult = cmpKeys(lower, upper);
     if (cmpResult === 1 || cmpResult === 0 && (lowerOpen || upperOpen)) {
       throw new DataError();
     }
-    lower = valueToKey(lower);
-    upper = valueToKey(upper);
     return new FDBKeyRange(lower, upper, lowerOpen, upperOpen);
   }
   constructor(lower, upper, lowerOpen, upperOpen) {
@@ -290,13 +313,13 @@ class FDBKeyRange {
     }
     key = valueToKey(key);
     if (this.lower !== void 0) {
-      const cmpResult = cmp(this.lower, key);
+      const cmpResult = cmpKeys(this.lower, key);
       if (cmpResult === 1 || cmpResult === 0 && this.lowerOpen) {
         return false;
       }
     }
     if (this.upper !== void 0) {
-      const cmpResult = cmp(this.upper, key);
+      const cmpResult = cmpKeys(this.upper, key);
       if (cmpResult === -1 || cmpResult === 0 && this.upperOpen) {
         return false;
       }
@@ -377,7 +400,7 @@ const makeKeyRange = (range, lowers, uppers) => {
     if (lowerTemp === void 0) {
       continue;
     }
-    if (lower === void 0 || cmp(lower, lowerTemp) === 1) {
+    if (lower === void 0 || cmpKeys(lower, lowerTemp) === 1) {
       lower = lowerTemp;
     }
   }
@@ -385,7 +408,7 @@ const makeKeyRange = (range, lowers, uppers) => {
     if (upperTemp === void 0) {
       continue;
     }
-    if (upper === void 0 || cmp(upper, upperTemp) === -1) {
+    if (upper === void 0 || cmpKeys(upper, upperTemp) === -1) {
       upper = upperTemp;
     }
   }
@@ -448,8 +471,8 @@ class FDBCursor {
     if (this.direction === "next") {
       const range = makeKeyRange(this._range, [key, this._position], []);
       for (const record2 of records.values(range)) {
-        const cmpResultKey = key !== void 0 ? cmp(record2.key, key) : void 0;
-        const cmpResultPosition = this._position !== void 0 ? cmp(record2.key, this._position) : void 0;
+        const cmpResultKey = key !== void 0 ? cmpKeys(record2.key, key) : void 0;
+        const cmpResultPosition = this._position !== void 0 ? cmpKeys(record2.key, this._position) : void 0;
         if (key !== void 0) {
           if (cmpResultKey === -1) {
             continue;
@@ -459,7 +482,7 @@ class FDBCursor {
           if (cmpResultKey === -1) {
             continue;
           }
-          const cmpResultPrimaryKey = cmp(record2.value, primaryKey);
+          const cmpResultPrimaryKey = cmpKeys(record2.value, primaryKey);
           if (cmpResultKey === 0 && cmpResultPrimaryKey === -1) {
             continue;
           }
@@ -473,7 +496,7 @@ class FDBCursor {
           if (cmpResultPosition === -1) {
             continue;
           }
-          if (cmpResultPosition === 0 && cmp(record2.value, this._objectStorePosition) !== 1) {
+          if (cmpResultPosition === 0 && cmpKeys(record2.value, this._objectStorePosition) !== 1) {
             continue;
           }
         }
@@ -489,12 +512,12 @@ class FDBCursor {
       const range = makeKeyRange(this._range, [key, this._position], []);
       for (const record2 of records.values(range)) {
         if (key !== void 0) {
-          if (cmp(record2.key, key) === -1) {
+          if (cmpKeys(record2.key, key) === -1) {
             continue;
           }
         }
         if (this._position !== void 0) {
-          if (cmp(record2.key, this._position) !== 1) {
+          if (cmpKeys(record2.key, this._position) !== 1) {
             continue;
           }
         }
@@ -509,8 +532,8 @@ class FDBCursor {
     } else if (this.direction === "prev") {
       const range = makeKeyRange(this._range, [], [key, this._position]);
       for (const record2 of records.values(range, "prev")) {
-        const cmpResultKey = key !== void 0 ? cmp(record2.key, key) : void 0;
-        const cmpResultPosition = this._position !== void 0 ? cmp(record2.key, this._position) : void 0;
+        const cmpResultKey = key !== void 0 ? cmpKeys(record2.key, key) : void 0;
+        const cmpResultPosition = this._position !== void 0 ? cmpKeys(record2.key, this._position) : void 0;
         if (key !== void 0) {
           if (cmpResultKey === 1) {
             continue;
@@ -520,7 +543,7 @@ class FDBCursor {
           if (cmpResultKey === 1) {
             continue;
           }
-          const cmpResultPrimaryKey = cmp(record2.value, primaryKey);
+          const cmpResultPrimaryKey = cmpKeys(record2.value, primaryKey);
           if (cmpResultKey === 0 && cmpResultPrimaryKey === 1) {
             continue;
           }
@@ -534,7 +557,7 @@ class FDBCursor {
           if (cmpResultPosition === 1) {
             continue;
           }
-          if (cmpResultPosition === 0 && cmp(record2.value, this._objectStorePosition) !== -1) {
+          if (cmpResultPosition === 0 && cmpKeys(record2.value, this._objectStorePosition) !== -1) {
             continue;
           }
         }
@@ -551,12 +574,12 @@ class FDBCursor {
       const range = makeKeyRange(this._range, [], [key, this._position]);
       for (const record2 of records.values(range, "prev")) {
         if (key !== void 0) {
-          if (cmp(record2.key, key) === 1) {
+          if (cmpKeys(record2.key, key) === 1) {
             continue;
           }
         }
         if (this._position !== void 0) {
-          if (cmp(record2.key, this._position) !== -1) {
+          if (cmpKeys(record2.key, this._position) !== -1) {
             continue;
           }
         }
@@ -707,7 +730,7 @@ class FDBCursor {
     }
     if (key !== void 0) {
       key = valueToKey(key);
-      const cmpResult = cmp(key, this._position);
+      const cmpResult = cmpKeys(key, this._position);
       if (cmpResult <= 0 && (this.direction === "next" || this.direction === "nextunique") || cmpResult >= 0 && (this.direction === "prev" || this.direction === "prevunique")) {
         throw new DataError();
       }
@@ -745,11 +768,12 @@ class FDBCursor {
       throw new DataError();
     }
     key = valueToKey(key);
-    const cmpResult = cmp(key, this._position);
+    const cmpResult = cmpKeys(key, this._position);
     if (cmpResult === -1 && this.direction === "next" || cmpResult === 1 && this.direction === "prev") {
       throw new DataError();
     }
-    const cmpResult2 = cmp(primaryKey, this._objectStorePosition);
+    primaryKey = valueToKey(primaryKey);
+    const cmpResult2 = cmpKeys(primaryKey, this._objectStorePosition);
     if (cmpResult === 0) {
       if (cmpResult2 <= 0 && this.direction === "next" || cmpResult2 >= 0 && this.direction === "prev") {
         throw new DataError();
@@ -1288,11 +1312,11 @@ class BinarySearchTree {
     return !!this.get(record2);
   }
   _compare(a, b) {
-    const keyComparison = cmp(a.key, b.key);
+    const keyComparison = cmpKeys(a.key, b.key);
     if (keyComparison !== 0) {
       return keyComparison;
     }
-    return this._keysAreUnique ? 0 : cmp(a.value, b.value);
+    return this._keysAreUnique ? 0 : cmpKeys(a.value, b.value);
   }
   _getByComparator(node2, comparator) {
     let current2 = node2;
@@ -1420,8 +1444,8 @@ class BinarySearchTree {
         key
       }
     } = node2;
-    const lowerComparison = lower === void 0 ? -1 : cmp(lower, key);
-    const upperComparison = upper === void 0 ? 1 : cmp(upper, key);
+    const lowerComparison = lower === void 0 ? -1 : cmpKeys(lower, key);
+    const upperComparison = upper === void 0 ? 1 : cmpKeys(upper, key);
     const moreLeft = this._keysAreUnique ? lowerComparison < 0 : lowerComparison <= 0;
     const moreRight = this._keysAreUnique ? upperComparison > 0 : upperComparison >= 0;
     const moreStart = descending ? moreRight : moreLeft;
@@ -1495,14 +1519,12 @@ class BinarySearchTree {
     return newRoot;
   }
   // rebuild the whole tree from scratch, used to avoid too many deletion tombstones accumulating
-  _rebuild(records, parent2, red) {
-    const {
-      length
-    } = records;
-    if (!length) {
+  _rebuild(records, parent2, red, startIndex = 0, endIndex = records.length) {
+    const length = endIndex - startIndex;
+    if (length <= 0) {
       return void 0;
     }
-    const mid = length >>> 1;
+    const mid = startIndex + (length >>> 1);
     const node2 = {
       record: records[mid],
       left: void 0,
@@ -1511,8 +1533,8 @@ class BinarySearchTree {
       deleted: false,
       red
     };
-    const left = this._rebuild(records.slice(0, mid), node2, !red);
-    const right = this._rebuild(records.slice(mid + 1), node2, !red);
+    const left = this._rebuild(records, node2, !red, startIndex, mid);
+    const right = this._rebuild(records, node2, !red, mid + 1, endIndex);
     node2.left = left;
     node2.right = right;
     return node2;
@@ -1543,16 +1565,18 @@ class RecordStore {
     }
     return deletedRecords;
   }
-  deleteByValue(key) {
-    const range = key instanceof FDBKeyRange ? key : FDBKeyRange.only(key);
-    const deletedRecords = [];
-    for (const record2 of this.records.getAllRecords()) {
-      if (range.includes(record2.value)) {
-        this.records.delete(record2);
-        deletedRecords.push(record2);
-      }
+  /**
+   * Delete the record with this key and this value, if there is one. Used by indexes, where the value is the primary
+   * key of the object store record that the index record points to.
+   */
+  deleteByKeyAndValue(key, value2) {
+    const record2 = this.records.get({
+      key,
+      value: value2
+    });
+    if (record2 !== void 0 && cmpKeys(record2.value, value2) === 0) {
+      this.records.delete(record2);
     }
-    return deletedRecords;
   }
   clear() {
     const deletedRecords = [...this.records.getAllRecords()];
@@ -1577,7 +1601,7 @@ class RecordStore {
           return {
             next: () => {
               let current3 = next();
-              while (!current3.done && previousValue !== void 0 && cmp(previousValue.key, current3.value.key) === 0) {
+              while (!current3.done && previousValue !== void 0 && cmpKeys(previousValue.key, current3.value.key) === 0) {
                 current3 = next();
               }
               previousValue = current3.value;
@@ -1589,7 +1613,7 @@ class RecordStore {
         let nextResult = next();
         return {
           next: () => {
-            while (!nextResult.done && cmp(current2.value.key, nextResult.value.key) === 0) {
+            while (!nextResult.done && cmpKeys(current2.value.key, nextResult.value.key) === 0) {
               current2 = nextResult;
               nextResult = next();
             }
@@ -1671,11 +1695,14 @@ class Index {
     }
     return records;
   }
-  // http://www.w3.org/TR/2015/REC-IndexedDB-20150108/#dfn-steps-for-storing-a-record-into-an-object-store (step 7)
-  storeRecord(newRecord) {
+  // The index key that an object store record with this value is stored under, or undefined if the value does not
+  // belong in this index. For a multiEntry index given an array, this is the array of individual index keys (invalid
+  // and duplicate elements removed). Shared by storeRecord and deleteRecord so that deletion finds exactly what
+  // insertion stored.
+  getIndexKey(value2) {
     let indexKey;
     try {
-      indexKey = extractKey(this.keyPath, newRecord.value).key;
+      indexKey = extractKey(this.keyPath, value2).key;
     } catch (err) {
       if (err.name === "DataError") {
         return;
@@ -1684,21 +1711,27 @@ class Index {
     }
     if (!this.multiEntry || !Array.isArray(indexKey)) {
       try {
-        valueToKey(indexKey);
+        return valueToKey(indexKey);
       } catch (e) {
         return;
       }
-    } else {
-      const keep = [];
-      for (const part of indexKey) {
-        if (keep.indexOf(part) < 0) {
-          try {
-            keep.push(valueToKey(part));
-          } catch (err) {
-          }
+    }
+    const keep = [];
+    for (const part of indexKey) {
+      if (keep.indexOf(part) < 0) {
+        try {
+          keep.push(valueToKey(part));
+        } catch (err) {
         }
       }
-      indexKey = keep;
+    }
+    return keep;
+  }
+  // http://www.w3.org/TR/2015/REC-IndexedDB-20150108/#dfn-steps-for-storing-a-record-into-an-object-store (step 7)
+  storeRecord(newRecord) {
+    const indexKey = this.getIndexKey(newRecord.value);
+    if (indexKey === void 0) {
+      return;
     }
     if (!this.multiEntry || !Array.isArray(indexKey)) {
       if (this.unique) {
@@ -1707,6 +1740,10 @@ class Index {
           throw new ConstraintError();
         }
       }
+      this.records.put({
+        key: indexKey,
+        value: newRecord.key
+      });
     } else {
       if (this.unique) {
         for (const individualIndexKey of indexKey) {
@@ -1716,18 +1753,26 @@ class Index {
           }
         }
       }
-    }
-    if (!this.multiEntry || !Array.isArray(indexKey)) {
-      this.records.put({
-        key: indexKey,
-        value: newRecord.key
-      });
-    } else {
       for (const individualIndexKey of indexKey) {
         this.records.put({
           key: individualIndexKey,
           value: newRecord.key
         });
+      }
+    }
+  }
+  // Remove the index records that storeRecord created for this object store record. Looking them up by index key is
+  // O(log n) per index record, where scanning the whole index for records pointing at this primary key is O(n).
+  deleteRecord(record2) {
+    const indexKey = this.getIndexKey(record2.value);
+    if (indexKey === void 0) {
+      return;
+    }
+    if (!this.multiEntry || !Array.isArray(indexKey)) {
+      this.records.deleteByKeyAndValue(indexKey, record2.key);
+    } else {
+      for (const individualIndexKey of indexKey) {
+        this.records.deleteByKeyAndValue(individualIndexKey, record2.key);
       }
     }
   }
@@ -2283,7 +2328,7 @@ class FDBTransaction extends FakeEventTarget {
         request.result = void 0;
       }
     });
-    this._state = "finished";
+    this._markFinished();
   }
   abort() {
     if (this._state === "committing" || this._state === "finished") {
@@ -2394,12 +2439,24 @@ class FDBTransaction extends FakeEventTarget {
       return;
     }
     if (this._state !== "finished") {
-      this._state = "finished";
+      this._markFinished();
       if (!this.error) {
         const event = new Event$1("complete");
         this.dispatchEvent(event);
       }
     }
+  }
+  _markFinished() {
+    this._state = "finished";
+    queueTask(() => {
+      const {
+        transactions
+      } = this.db._rawDatabase;
+      const idx = transactions.indexOf(this);
+      if (idx !== -1) {
+        transactions.splice(idx, 1);
+      }
+    });
   }
   commit() {
     if (this._state !== "active") {
@@ -2499,7 +2556,7 @@ class ObjectStore {
     if (this.keyPath !== null) {
       const key = extractKey(this.keyPath, newRecord.value).key;
       if (key !== void 0) {
-        newRecord.key = key;
+        newRecord.key = valueToKey(key);
       }
     }
     const rollbackLogForThisOperation = [];
@@ -2577,7 +2634,7 @@ class ObjectStore {
     }
     if (existingRecord) {
       for (const rawIndex of this.rawIndexes.values()) {
-        rawIndex.records.deleteByValue(newRecord.key);
+        rawIndex.deleteRecord(existingRecord);
       }
     }
     try {
@@ -2607,7 +2664,9 @@ class ObjectStore {
       }
     }
     for (const rawIndex of this.rawIndexes.values()) {
-      rawIndex.records.deleteByValue(key);
+      for (const record2 of deletedRecords) {
+        rawIndex.deleteRecord(record2);
+      }
     }
   }
   // http://www.w3.org/TR/2015/REC-IndexedDB-20150108/#dfn-steps-for-clearing-an-object-store
@@ -2727,8 +2786,8 @@ class FDBDatabase extends FakeEventTarget {
       throw new TypeError();
     }
     const transaction = confirmActiveVersionchangeTransaction(this);
-    const store = this._rawDatabase.rawObjectStores.get(name2);
-    if (store === void 0) {
+    const store2 = this._rawDatabase.rawObjectStores.get(name2);
+    if (store2 === void 0) {
       throw new NotFoundError();
     }
     this.objectStoreNames = new FakeDOMStringList(...Array.from(this.objectStoreNames).filter((objectStoreName) => {
@@ -2742,16 +2801,16 @@ class FDBDatabase extends FakeEventTarget {
       objectStore.indexNames = new FakeDOMStringList();
     }
     transaction._rollbackLog.push(() => {
-      store.deleted = false;
-      this._rawDatabase.rawObjectStores.set(store.name, store);
-      this.objectStoreNames._push(store.name);
-      transaction.objectStoreNames._push(store.name);
+      store2.deleted = false;
+      this._rawDatabase.rawObjectStores.set(store2.name, store2);
+      this.objectStoreNames._push(store2.name);
+      transaction.objectStoreNames._push(store2.name);
       this.objectStoreNames._sort();
       if (objectStore && prevIndexNames) {
         objectStore.indexNames = new FakeDOMStringList(...prevIndexNames);
       }
     });
-    store.deleted = true;
+    store2.deleted = true;
     this._rawDatabase.rawObjectStores.delete(name2);
     transaction._objectStoresCache.delete(name2);
   }
@@ -2857,8 +2916,8 @@ function validateRequiredArguments(numArguments, expectedNumArguments, methodNam
   }
 }
 const runTaskInConnectionQueue = (connectionQueues, name2, task) => {
-  const queue = connectionQueues.get(name2) ?? Promise.resolve();
-  connectionQueues.set(name2, queue.then(task));
+  const queue2 = connectionQueues.get(name2) ?? Promise.resolve();
+  connectionQueues.set(name2, queue2.then(task));
 };
 const waitForOthersClosedDelete = (databases, name2, openDatabases, cb) => {
   const anyOpen = openDatabases.some((openDatabase2) => {
@@ -4657,23 +4716,23 @@ let Blob$1 = class Blob2 {
    * @returns New Blob.
    */
   slice(start2 = 0, end2 = null, contentType2 = "") {
-    const size = this.size;
+    const size2 = this.size;
     let relativeStart;
     let relativeEnd;
     let relativeContentType;
     if (start2 === void 0) {
       relativeStart = 0;
     } else if (start2 < 0) {
-      relativeStart = Math.max(size + start2, 0);
+      relativeStart = Math.max(size2 + start2, 0);
     } else {
-      relativeStart = Math.min(start2, size);
+      relativeStart = Math.min(start2, size2);
     }
     if (end2 === null) {
-      relativeEnd = size;
+      relativeEnd = size2;
     } else if (end2 < 0) {
-      relativeEnd = Math.max(size + end2, 0);
+      relativeEnd = Math.max(size2 + end2, 0);
     } else {
-      relativeEnd = Math.min(end2, size);
+      relativeEnd = Math.min(end2, size2);
     }
     if (contentType2 === void 0) {
       relativeContentType = "";
@@ -11811,6 +11870,28 @@ const PublicSuffixList = {
     "execute-api.us-gov-west-1.amazonaws.com",
     "execute-api.us-west-1.amazonaws.com",
     "execute-api.us-west-2.amazonaws.com",
+    "consent-portal.bedrock-agentcore.ap-northeast-1.amazonaws.com",
+    "consent-portal.bedrock-agentcore.ap-northeast-2.amazonaws.com",
+    "consent-portal.bedrock-agentcore.ap-south-1.amazonaws.com",
+    "consent-portal.bedrock-agentcore.ap-south-2.amazonaws.com",
+    "consent-portal.bedrock-agentcore.ap-southeast-1.amazonaws.com",
+    "consent-portal.bedrock-agentcore.ap-southeast-2.amazonaws.com",
+    "consent-portal.bedrock-agentcore.ap-southeast-5.amazonaws.com",
+    "consent-portal.bedrock-agentcore.ap-southeast-7.amazonaws.com",
+    "consent-portal.bedrock-agentcore.ca-central-1.amazonaws.com",
+    "consent-portal.bedrock-agentcore.eu-central-1.amazonaws.com",
+    "consent-portal.bedrock-agentcore.eu-north-1.amazonaws.com",
+    "consent-portal.bedrock-agentcore.eu-south-1.amazonaws.com",
+    "consent-portal.bedrock-agentcore.eu-south-2.amazonaws.com",
+    "consent-portal.bedrock-agentcore.eu-west-1.amazonaws.com",
+    "consent-portal.bedrock-agentcore.eu-west-2.amazonaws.com",
+    "consent-portal.bedrock-agentcore.eu-west-3.amazonaws.com",
+    "consent-portal.bedrock-agentcore.sa-east-1.amazonaws.com",
+    "consent-portal.bedrock-agentcore.us-east-1.amazonaws.com",
+    "consent-portal.bedrock-agentcore.us-east-2.amazonaws.com",
+    "consent-portal.bedrock-agentcore.us-gov-west-1.amazonaws.com",
+    "consent-portal.bedrock-agentcore.us-west-1.amazonaws.com",
+    "consent-portal.bedrock-agentcore.us-west-2.amazonaws.com",
     "cloudfront.net",
     "auth.af-south-1.amazoncognito.com",
     "auth.ap-east-1.amazoncognito.com",
@@ -12484,6 +12565,7 @@ const PublicSuffixList = {
     "lambda-url.us-west-2.on.aws",
     "transfer-webapp.af-south-1.on.aws",
     "transfer-webapp.ap-east-1.on.aws",
+    "transfer-webapp.ap-east-2.on.aws",
     "transfer-webapp.ap-northeast-1.on.aws",
     "transfer-webapp.ap-northeast-2.on.aws",
     "transfer-webapp.ap-northeast-3.on.aws",
@@ -12494,6 +12576,7 @@ const PublicSuffixList = {
     "transfer-webapp.ap-southeast-3.on.aws",
     "transfer-webapp.ap-southeast-4.on.aws",
     "transfer-webapp.ap-southeast-5.on.aws",
+    "transfer-webapp.ap-southeast-6.on.aws",
     "transfer-webapp.ap-southeast-7.on.aws",
     "transfer-webapp.ca-central-1.on.aws",
     "transfer-webapp.ca-west-1.on.aws",
@@ -12520,6 +12603,7 @@ const PublicSuffixList = {
     "transfer-webapp.us-west-2.on.aws",
     "transfer-webapp.cn-north-1.on.amazonwebservices.com.cn",
     "transfer-webapp.cn-northwest-1.on.amazonwebservices.com.cn",
+    "transfer-webapp.eusc-de-east-1.on.amazonwebservices.eu",
     "eero.online",
     "eero-stage.online",
     "opentunnel.xyz",
@@ -13415,7 +13499,6 @@ const PublicSuffixList = {
     "githubpreview.dev",
     "github.io",
     "gitlab.io",
-    "gitapp.si",
     "gitpage.si",
     "glideos.app",
     "nog.community",
@@ -13792,7 +13875,6 @@ const PublicSuffixList = {
     "kiloapps.io",
     "kinghost.net",
     "uni5.net",
-    "knightpoint.systems",
     "koobin.events",
     "webthings.io",
     "krellian.net",
@@ -14057,6 +14139,45 @@ const PublicSuffixList = {
     "yali.mythic-beasts.com",
     "cust.retrosnub.co.uk",
     "ui.nabu.casa",
+    "kr.object.fin-ncloudstorage.com",
+    "s3-website.kr.object.fin-ncloudstorage.com",
+    "kr.object.private.fin-ncloudstorage.com",
+    "kr.gov-ncloudstorage.com",
+    "kr-private.gov-ncloudstorage.com",
+    "kr.object.gov-ncloudstorage.com",
+    "s3-website.kr.object.gov-ncloudstorage.com",
+    "krs.object.gov-ncloudstorage.com",
+    "s3-website.krs.object.gov-ncloudstorage.com",
+    "kr.object.private.gov-ncloudstorage.com",
+    "krs.object.private.gov-ncloudstorage.com",
+    "kr.objectstorage.ncloud.com",
+    "sg.objectstorage.ncloud.com",
+    "kr.ncloudstorage.com",
+    "kr-naver.ncloudstorage.com",
+    "kr-naver-dev.ncloudstorage.com",
+    "kr-private.ncloudstorage.com",
+    "de.object.ncloudstorage.com",
+    "s3-website.de.object.ncloudstorage.com",
+    "kr.object.ncloudstorage.com",
+    "s3-website.kr.object.ncloudstorage.com",
+    "sg.object.ncloudstorage.com",
+    "s3-website.sg.object.ncloudstorage.com",
+    "us.object.ncloudstorage.com",
+    "s3-website.us.object.ncloudstorage.com",
+    "kr.object.private.ncloudstorage.com",
+    "sg.object.private.ncloudstorage.com",
+    "kr.website.ncloudstorage.com",
+    "kr-naver.website.ncloudstorage.com",
+    "kr-naver-dev.website.ncloudstorage.com",
+    "jp.object.ncpstorage.com",
+    "jp.jp4.object.ncpstorage.com",
+    "jp.jp5.object.ncpstorage.com",
+    "kr.object.ncpstorage.com",
+    "s3-website-jp.object.ncpstorage.com",
+    "jp.object.private.ncpstorage.com",
+    "jp.jp4.object.private.ncpstorage.com",
+    "jp.jp5.object.private.ncpstorage.com",
+    "kr.object.private.ncpstorage.com",
     "needle.run",
     "co.site",
     "cloud.nospamproxy.com",
@@ -14275,7 +14396,6 @@ const PublicSuffixList = {
     "gl.srv.us",
     "mypep.link",
     "pplx.app",
-    "perspecta.cloud",
     "forgeblocks.com",
     "id.forgerock.io",
     "support.site",
@@ -14872,6 +14992,7 @@ const PublicSuffixList = {
     "airflow.ap-southeast-3.on.aws",
     "airflow.ap-southeast-4.on.aws",
     "airflow.ap-southeast-5.on.aws",
+    "airflow.ap-southeast-7.on.aws",
     "airflow.ca-central-1.on.aws",
     "airflow.ca-west-1.on.aws",
     "airflow.eu-central-1.on.aws",
@@ -15547,12 +15668,12 @@ class ResponseCacheFileSystem {
             }
           };
           const json = JSON.stringify(cacheableEntry, null, 3);
-          const hash = Crypto.createHash("md5").update(json).digest("hex");
-          if (!this.#hashes.has(hash)) {
-            this.#hashes.add(hash);
-            promises.push(FS.promises.writeFile(Path.join(absoluteDirectory, `${hash}.json`), json));
+          const hash2 = Crypto.createHash("md5").update(json).digest("hex");
+          if (!this.#hashes.has(hash2)) {
+            this.#hashes.add(hash2);
+            promises.push(FS.promises.writeFile(Path.join(absoluteDirectory, `${hash2}.json`), json));
             if (cachedResponse2.response.body) {
-              promises.push(FS.promises.writeFile(Path.join(absoluteDirectory, `${hash}.data`), cachedResponse2.response.body));
+              promises.push(FS.promises.writeFile(Path.join(absoluteDirectory, `${hash2}.data`), cachedResponse2.response.body));
             }
           }
         }
@@ -16314,8 +16435,8 @@ class Base64 {
    * @returns Base64-encoded string.
    */
   static btoa(data2) {
-    const str = data2.toString();
-    if (/[^\u0000-\u00ff]/.test(str)) {
+    const str2 = data2.toString();
+    if (/[^\u0000-\u00ff]/.test(str2)) {
       throw new DOMException$1("Failed to execute 'btoa' on 'Window': The string to be encoded contains characters outside of the Latin1 range.", DOMExceptionNameEnum$1.invalidCharacterError);
     }
     let t = "";
@@ -16324,10 +16445,10 @@ class Base64 {
     let i = 0;
     let v = 0;
     let c;
-    while (i < str.length || p > -6) {
+    while (i < str2.length || p > -6) {
       if (p < 0) {
-        if (i < str.length) {
-          c = str.charCodeAt(i++);
+        if (i < str2.length) {
+          c = str2.charCodeAt(i++);
           v += 8;
         } else {
           c = 0;
@@ -16351,11 +16472,11 @@ class Base64 {
    * @returns An ASCII string containing decoded data from encodedData.
    */
   static atob(data2) {
-    const str = data2.toString();
-    if (/[^\u0000-\u00ff]/.test(str)) {
+    const str2 = data2.toString();
+    if (/[^\u0000-\u00ff]/.test(str2)) {
       throw new DOMException$1("Failed to execute 'atob' on 'Window': The string to be decoded contains characters outside of the Latin1 range.", DOMExceptionNameEnum$1.invalidCharacterError);
     }
-    if (/[^A-Za-z\d+/=]/.test(str) || str.length % 4 == 1) {
+    if (/[^A-Za-z\d+/=]/.test(str2) || str2.length % 4 == 1) {
       throw new DOMException$1("Failed to execute 'atob' on 'Window': The string to be decoded is not correctly encoded.", DOMExceptionNameEnum$1.invalidCharacterError);
     }
     let t = "";
@@ -16363,8 +16484,8 @@ class Base64 {
     let a = 0;
     let c;
     let d;
-    for (let i = 0; i < str.length; i++) {
-      if ((c = BASE64_CHARS.indexOf(str.charAt(i))) < 0) {
+    for (let i = 0; i < str2.length; i++) {
+      if ((c = BASE64_CHARS.indexOf(str2.charAt(i))) < 0) {
         continue;
       }
       a = a << 6 | c & 63;
@@ -16929,7 +17050,7 @@ class CSSStringUtility {
    * @returns Array of parts.
    */
   static splitByComma(value2) {
-    const parts = [];
+    const parts2 = [];
     const regexp = new RegExp(SPLIT_BY_COMMA_REGEXP);
     let match;
     let depth = 0;
@@ -16946,7 +17067,7 @@ class CSSStringUtility {
           if (depth === 0) {
             const part = value2.substring(lastIndex, match.index).trim();
             if (part) {
-              parts.push(part);
+              parts2.push(part);
             }
             lastIndex = regexp.lastIndex;
           }
@@ -16954,9 +17075,9 @@ class CSSStringUtility {
       }
     }
     if (lastIndex < value2.length) {
-      parts.push(value2.substring(lastIndex).trim());
+      parts2.push(value2.substring(lastIndex).trim());
     }
-    return parts;
+    return parts2;
   }
   /**
    * Splits by space while respecting nested parentheses.
@@ -16965,7 +17086,7 @@ class CSSStringUtility {
    * @returns Array of parts.
    */
   static splitBySpace(value2) {
-    const parts = [];
+    const parts2 = [];
     const regexp = new RegExp(SPLIT_BY_SPACE_REGEXP);
     let match;
     let depth = 0;
@@ -16982,7 +17103,7 @@ class CSSStringUtility {
           if (depth === 0) {
             const part = value2.substring(lastIndex, match.index).trim();
             if (part) {
-              parts.push(part);
+              parts2.push(part);
             }
             lastIndex = regexp.lastIndex;
           }
@@ -16992,10 +17113,10 @@ class CSSStringUtility {
     if (lastIndex < value2.length) {
       const part = value2.substring(lastIndex).trim();
       if (part) {
-        parts.push(part);
+        parts2.push(part);
       }
     }
-    return parts;
+    return parts2;
   }
 }
 const COLOR_REGEXP = /^#([0-9a-fA-F]{3,4}){1,2}$|^(rgba?|hsla?)\((.*)\)$/;
@@ -17310,8 +17431,8 @@ class CSSValueFormatter {
     const match = value2.match(GRADIENT_REGEXP);
     if (match) {
       const args = match[3].trim();
-      const parts = CSSStringUtility.splitByComma(args);
-      return `${match[1]}(${parts.join(", ")})`;
+      const parts2 = CSSStringUtility.splitByComma(args);
+      return `${match[1]}(${parts2.join(", ")})`;
     }
     return null;
   }
@@ -17761,11 +17882,11 @@ class CSSPropertySetParser {
     if (!matches) {
       return null;
     }
-    const parts = matches[1].split(/\s*,\s*/);
-    if (parts.length !== 4) {
+    const parts2 = matches[1].split(/\s*,\s*/);
+    if (parts2.length !== 4) {
       return null;
     }
-    for (const part of parts) {
+    for (const part of parts2) {
       if (!CSSValueFormatter.getMeasurement(part)) {
         return null;
       }
@@ -17830,8 +17951,8 @@ class CSSPropertySetParser {
       ...this.getOutlineStyle("initial", important),
       ...this.getOutlineWidth("initial", important)
     };
-    const parts = value2.split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
-    for (const part of parts) {
+    const parts2 = value2.split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
+    for (const part of parts2) {
       const width2 = this.getOutlineWidth(part, important);
       const style2 = this.getOutlineStyle(part, important);
       const color = this.getOutlineColor(part, important);
@@ -17934,8 +18055,8 @@ class CSSPropertySetParser {
       ...this.getBorderColor("initial", important),
       ...this.getBorderImage("initial", important)
     };
-    const parts = value2.replace(/\s*,\s*/g, ",").split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
-    for (const part of parts) {
+    const parts2 = value2.replace(/\s*,\s*/g, ",").split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
+    for (const part of parts2) {
       const width2 = this.getBorderWidth(part, important);
       const style2 = this.getBorderStyle(part, important);
       const color = this.getBorderColor(part, important);
@@ -17967,11 +18088,11 @@ class CSSPropertySetParser {
         ...this.getBorderLeftWidth(globalValue, important)
       };
     }
-    const parts = value2.split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
-    const top2 = this.getBorderTopWidth(parts[0], important);
-    const right = this.getBorderRightWidth(parts[1] || parts[0], important);
-    const bottom = this.getBorderBottomWidth(parts[2] || parts[0], important);
-    const left = this.getBorderLeftWidth(parts[3] || parts[1] || parts[0], important);
+    const parts2 = value2.split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
+    const top2 = this.getBorderTopWidth(parts2[0], important);
+    const right = this.getBorderRightWidth(parts2[1] || parts2[0], important);
+    const bottom = this.getBorderBottomWidth(parts2[2] || parts2[0], important);
+    const left = this.getBorderLeftWidth(parts2[3] || parts2[1] || parts2[0], important);
     if (!top2 || !right || !bottom || !left) {
       return null;
     }
@@ -18003,11 +18124,11 @@ class CSSPropertySetParser {
         ...this.getBorderLeftStyle(globalValue, important)
       };
     }
-    const parts = value2.split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
-    const top2 = this.getBorderTopStyle(parts[0], important);
-    const right = this.getBorderRightStyle(parts[1] || parts[0], important);
-    const bottom = this.getBorderBottomStyle(parts[2] || parts[0], important);
-    const left = this.getBorderLeftStyle(parts[3] || parts[1] || parts[0], important);
+    const parts2 = value2.split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
+    const top2 = this.getBorderTopStyle(parts2[0], important);
+    const right = this.getBorderRightStyle(parts2[1] || parts2[0], important);
+    const bottom = this.getBorderBottomStyle(parts2[2] || parts2[0], important);
+    const left = this.getBorderLeftStyle(parts2[3] || parts2[1] || parts2[0], important);
     if (!top2 || !right || !bottom || !left) {
       return null;
     }
@@ -18039,11 +18160,11 @@ class CSSPropertySetParser {
         ...this.getBorderLeftColor(globalValue, important)
       };
     }
-    const parts = value2.split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
-    const top2 = this.getBorderTopColor(parts[0], important);
-    const right = this.getBorderRightColor(parts[1] || parts[0], important);
-    const bottom = this.getBorderBottomColor(parts[2] || parts[0], important);
-    const left = this.getBorderLeftColor(parts[3] || parts[1] || parts[0], important);
+    const parts2 = value2.split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
+    const top2 = this.getBorderTopColor(parts2[0], important);
+    const right = this.getBorderRightColor(parts2[1] || parts2[0], important);
+    const bottom = this.getBorderBottomColor(parts2[2] || parts2[0], important);
+    const left = this.getBorderLeftColor(parts2[3] || parts2[1] || parts2[0], important);
     if (!top2 || !right || !bottom || !left) {
       return null;
     }
@@ -18081,9 +18202,9 @@ class CSSPropertySetParser {
     if (sourceMatch) {
       parsedValue = parsedValue.replace(sourceMatch[0], "");
     }
-    const parts = parsedValue.split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
+    const parts2 = parsedValue.split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
     if (sourceMatch) {
-      parts.push(sourceMatch[1]);
+      parts2.push(sourceMatch[1]);
     }
     const properties2 = {
       ...this.getBorderImageSource("none", important),
@@ -18092,9 +18213,9 @@ class CSSPropertySetParser {
       ...this.getBorderImageOutset("0", important),
       ...this.getBorderImageRepeat("stretch", important)
     };
-    for (let i = 0, max = parts.length; i < max; i++) {
-      const part = parts[i];
-      const previousPart = i > 0 ? parts[i - 1] : "";
+    for (let i = 0, max = parts2.length; i < max; i++) {
+      const part = parts2[i];
+      const previousPart = i > 0 ? parts2[i - 1] : "";
       if (!part.startsWith("url") && part.includes("/")) {
         const [slice, width2, outset] = part.split("/");
         const borderImageSlice = this.getBorderImageSlice(`${previousPart} ${slice}`, important) || this.getBorderImageSlice(slice, important);
@@ -18221,11 +18342,11 @@ class CSSPropertySetParser {
         }
       };
     }
-    const parts = lowerValue.split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
-    if (parts.length > 4) {
+    const parts2 = lowerValue.split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
+    if (parts2.length > 4) {
       return null;
     }
-    for (const part of parts) {
+    for (const part of parts2) {
       if (!CSSValueFormatter.getInteger(part) && !CSSValueFormatter.getAutoMeasurement(part)) {
         return null;
       }
@@ -18266,12 +18387,12 @@ class CSSPropertySetParser {
         }
       };
     }
-    const parts = value2.split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
-    if (parts.length > 4) {
+    const parts2 = value2.split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
+    if (parts2.length > 4) {
       return null;
     }
     const newParts = [];
-    for (const part of parts) {
+    for (const part of parts2) {
       const parsedValue = CSSValueFormatter.getLength(part) || CSSValueFormatter.getFloat(part);
       if (!parsedValue) {
         return null;
@@ -18306,11 +18427,11 @@ class CSSPropertySetParser {
         }
       };
     }
-    const parts = lowerValue.split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
-    if (parts.length > 2) {
+    const parts2 = lowerValue.split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
+    if (parts2.length > 2) {
       return null;
     }
-    for (const part of parts) {
+    for (const part of parts2) {
       if (!BORDER_IMAGE_REPEAT.includes(part)) {
         return null;
       }
@@ -18575,11 +18696,11 @@ class CSSPropertySetParser {
         ...this.getBorderBottomLeftRadius(globalValue, important)
       };
     }
-    const parts = value2.split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
-    const topLeft = this.getBorderTopLeftRadius(parts[0], important);
-    const topRight = this.getBorderTopRightRadius(parts[1] || parts[0], important);
-    const bottomRight = this.getBorderBottomRightRadius(parts[2] || parts[0], important);
-    const bottomLeft = this.getBorderBottomLeftRadius(parts[3] || parts[1] || parts[0], important);
+    const parts2 = value2.split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
+    const topLeft = this.getBorderTopLeftRadius(parts2[0], important);
+    const topRight = this.getBorderTopRightRadius(parts2[1] || parts2[0], important);
+    const bottomRight = this.getBorderBottomRightRadius(parts2[2] || parts2[0], important);
+    const bottomLeft = this.getBorderBottomLeftRadius(parts2[3] || parts2[1] || parts2[0], important);
     if (!topLeft || !topRight || !bottomRight || !bottomLeft) {
       return null;
     }
@@ -18675,8 +18796,8 @@ class CSSPropertySetParser {
       ...this.getBorderTopStyle("initial", important),
       ...this.getBorderTopColor("initial", important)
     };
-    const parts = value2.split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
-    for (const part of parts) {
+    const parts2 = value2.split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
+    for (const part of parts2) {
       const width2 = this.getBorderTopWidth(part, important);
       const style2 = this.getBorderTopStyle(part, important);
       const color = this.getBorderTopColor(part, important);
@@ -18712,8 +18833,8 @@ class CSSPropertySetParser {
       ...this.getBorderRightStyle("initial", important),
       ...this.getBorderRightColor("initial", important)
     };
-    const parts = value2.split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
-    for (const part of parts) {
+    const parts2 = value2.split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
+    for (const part of parts2) {
       const width2 = this.getBorderRightWidth(part, important);
       const style2 = this.getBorderRightStyle(part, important);
       const color = this.getBorderRightColor(part, important);
@@ -18749,8 +18870,8 @@ class CSSPropertySetParser {
       ...this.getBorderBottomStyle("initial", important),
       ...this.getBorderBottomColor("initial", important)
     };
-    const parts = value2.split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
-    for (const part of parts) {
+    const parts2 = value2.split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
+    for (const part of parts2) {
       const width2 = this.getBorderBottomWidth(part, important);
       const style2 = this.getBorderBottomStyle(part, important);
       const color = this.getBorderBottomColor(part, important);
@@ -18786,8 +18907,8 @@ class CSSPropertySetParser {
       ...this.getBorderLeftStyle("initial", important),
       ...this.getBorderLeftColor("initial", important)
     };
-    const parts = value2.split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
-    for (const part of parts) {
+    const parts2 = value2.split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
+    for (const part of parts2) {
       const width2 = this.getBorderLeftWidth(part, important);
       const style2 = this.getBorderLeftStyle(part, important);
       const color = this.getBorderLeftColor(part, important);
@@ -18818,11 +18939,11 @@ class CSSPropertySetParser {
         ...this.getPaddingLeft(globalValue, important)
       };
     }
-    const parts = value2.split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
-    const top2 = this.getPaddingTop(parts[0], important);
-    const right = this.getPaddingRight(parts[1] || parts[0], important);
-    const bottom = this.getPaddingBottom(parts[2] || parts[0], important);
-    const left = this.getPaddingLeft(parts[3] || parts[1] || parts[0], important);
+    const parts2 = value2.split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
+    const top2 = this.getPaddingTop(parts2[0], important);
+    const right = this.getPaddingRight(parts2[1] || parts2[0], important);
+    const bottom = this.getPaddingBottom(parts2[2] || parts2[0], important);
+    const left = this.getPaddingLeft(parts2[3] || parts2[1] || parts2[0], important);
     if (!top2 || !right || !bottom || !left) {
       return null;
     }
@@ -18914,11 +19035,11 @@ class CSSPropertySetParser {
         ...this.getMarginLeft(globalValue, important)
       };
     }
-    const parts = value2.split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
-    const top2 = this.getMarginTop(parts[0], important);
-    const right = this.getMarginRight(parts[1] || parts[0], important);
-    const bottom = this.getMarginBottom(parts[2] || parts[0], important);
-    const left = this.getMarginLeft(parts[3] || parts[1] || parts[0], important);
+    const parts2 = value2.split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
+    const top2 = this.getMarginTop(parts2[0], important);
+    const right = this.getMarginRight(parts2[1] || parts2[0], important);
+    const bottom = this.getMarginBottom(parts2[2] || parts2[0], important);
+    const left = this.getMarginLeft(parts2[3] || parts2[1] || parts2[0], important);
     if (!top2 || !right || !bottom || !left) {
       return null;
     }
@@ -19032,10 +19153,10 @@ class CSSPropertySetParser {
         ...this.getFlexBasis(measurement, important)
       };
     }
-    const parts = value2.split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
-    const flexGrow = this.getFlexGrow(parts[0], important);
-    const flexShrink = this.getFlexShrink(parts[1] || "1", important);
-    const flexBasis = this.getFlexBasis(parts[2] || "0%", important);
+    const parts2 = value2.split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
+    const flexGrow = this.getFlexGrow(parts2[0], important);
+    const flexShrink = this.getFlexShrink(parts2[1] || "1", important);
+    const flexBasis = this.getFlexBasis(parts2[2] || "0%", important);
     if (!flexGrow || !flexShrink || !flexBasis) {
       return null;
     }
@@ -19130,14 +19251,14 @@ class CSSPropertySetParser {
       ...this.getBackgroundClip("initial", important),
       ...this.getBackgroundColor("initial", important)
     };
-    const parts = CSSStringUtility.splitBySpace(value2.replace(/\s+\/\s+/g, "/"));
+    const parts2 = CSSStringUtility.splitBySpace(value2.replace(/\s+\/\s+/g, "/"));
     const backgroundPositions = [];
-    for (const part of parts) {
+    for (const part of parts2) {
       if (!part.startsWith("url") && part.includes("/")) {
-        const [position, size] = part.split("/");
+        const [position, size2] = part.split("/");
         const backgroundPositionX = this.getBackgroundPositionX(position, important);
         const backgroundPositionY = this.getBackgroundPositionY(position, important);
-        const backgroundSize = this.getBackgroundSize(size, important);
+        const backgroundSize = this.getBackgroundSize(size2, important);
         if (!backgroundPositionX && !backgroundPositionY || !backgroundSize) {
           return null;
         }
@@ -19191,20 +19312,20 @@ class CSSPropertySetParser {
     const imageParts = lowerValue.split(SPLIT_COMMA_SEPARATED_WITH_PARANTHESES_REGEXP);
     const parsed = [];
     for (const imagePart of imageParts) {
-      const parts = imagePart.trim().split(" ");
-      if (parts.length !== 1 && parts.length !== 2) {
+      const parts2 = imagePart.trim().split(" ");
+      if (parts2.length !== 1 && parts2.length !== 2) {
         return null;
       }
-      if (parts.length === 1) {
-        if (parts[0] !== "cover" && parts[0] !== "contain" && !CSSValueFormatter.getAutoMeasurement(parts[0])) {
+      if (parts2.length === 1) {
+        if (parts2[0] !== "cover" && parts2[0] !== "contain" && !CSSValueFormatter.getAutoMeasurement(parts2[0])) {
           return null;
         }
-        parsed.push(parts[0]);
+        parsed.push(parts2[0]);
       } else {
-        if (!CSSValueFormatter.getAutoMeasurement(parts[0]) || !CSSValueFormatter.getAutoMeasurement(parts[1])) {
+        if (!CSSValueFormatter.getAutoMeasurement(parts2[0]) || !CSSValueFormatter.getAutoMeasurement(parts2[1])) {
           return null;
         }
-        parsed.push(`${parts[0]} ${parts[1]}`);
+        parsed.push(`${parts2[0]} ${parts2[1]}`);
       }
     }
     if (parsed.length === 1) {
@@ -19307,50 +19428,50 @@ class CSSPropertySetParser {
     let x3 = "";
     let y3 = "";
     for (const imagePart of imageParts) {
-      const parts = imagePart.trim().split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
+      const parts2 = imagePart.trim().split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
       if (x3) {
         x3 += ",";
         y3 += ",";
       }
-      switch (parts.length) {
+      switch (parts2.length) {
         case 1:
-          if (parts[0] === "top" || parts[0] === "bottom") {
+          if (parts2[0] === "top" || parts2[0] === "bottom") {
             x3 += "center";
-            y3 += parts[0];
-          } else if (parts[0] === "left" || parts[0] === "right") {
-            x3 += parts[0];
+            y3 += parts2[0];
+          } else if (parts2[0] === "left" || parts2[0] === "right") {
+            x3 += parts2[0];
             y3 += "center";
-          } else if (parts[0] === "center") {
+          } else if (parts2[0] === "center") {
             x3 += "center";
             y3 += "center";
           }
           break;
         case 2:
-          x3 += parts[0] === "top" || parts[0] === "bottom" ? parts[1] : parts[0];
-          y3 += parts[0] === "top" || parts[0] === "bottom" ? parts[0] : parts[1];
+          x3 += parts2[0] === "top" || parts2[0] === "bottom" ? parts2[1] : parts2[0];
+          y3 += parts2[0] === "top" || parts2[0] === "bottom" ? parts2[0] : parts2[1];
           break;
         case 3:
-          if (parts[0] === "top" || parts[0] === "bottom" || parts[1] === "left" || parts[1] === "right" || parts[2] === "left" || parts[2] === "right") {
-            if (CSSValueFormatter.getMeasurement(parts[1])) {
-              x3 += parts[2];
-              y3 += `${parts[0]} ${parts[1]}`;
+          if (parts2[0] === "top" || parts2[0] === "bottom" || parts2[1] === "left" || parts2[1] === "right" || parts2[2] === "left" || parts2[2] === "right") {
+            if (CSSValueFormatter.getMeasurement(parts2[1])) {
+              x3 += parts2[2];
+              y3 += `${parts2[0]} ${parts2[1]}`;
             } else {
-              x3 += `${parts[1]} ${parts[2]}`;
-              y3 += parts[0];
+              x3 += `${parts2[1]} ${parts2[2]}`;
+              y3 += parts2[0];
             }
           } else {
-            if (CSSValueFormatter.getMeasurement(parts[1])) {
-              x3 += `${parts[0]} ${parts[1]}`;
-              y3 += parts[2];
+            if (CSSValueFormatter.getMeasurement(parts2[1])) {
+              x3 += `${parts2[0]} ${parts2[1]}`;
+              y3 += parts2[2];
             } else {
-              x3 += parts[0];
-              y3 += `${parts[1]} ${parts[2]}`;
+              x3 += parts2[0];
+              y3 += `${parts2[1]} ${parts2[2]}`;
             }
           }
           break;
         case 4:
-          x3 += parts[0] === "top" || parts[0] === "bottom" || parts[1] === "top" || parts[1] === "bottom" ? `${parts[2]} ${parts[3]}` : `${parts[0]} ${parts[1]}`;
-          y3 += parts[0] === "top" || parts[0] === "bottom" || parts[1] === "top" || parts[1] === "bottom" ? `${parts[0]} ${parts[1]}` : `${parts[2]} ${parts[3]}`;
+          x3 += parts2[0] === "top" || parts2[0] === "bottom" || parts2[1] === "top" || parts2[1] === "bottom" ? `${parts2[2]} ${parts2[3]}` : `${parts2[0]} ${parts2[1]}`;
+          y3 += parts2[0] === "top" || parts2[0] === "bottom" || parts2[1] === "top" || parts2[1] === "bottom" ? `${parts2[0]} ${parts2[1]}` : `${parts2[2]} ${parts2[3]}`;
           break;
         default:
           return null;
@@ -19385,11 +19506,11 @@ class CSSPropertySetParser {
     const imageParts = lowerValue.split(SPLIT_COMMA_SEPARATED_WITH_PARANTHESES_REGEXP);
     let parsedValue = "";
     for (const imagePart of imageParts) {
-      const parts = imagePart.trim().split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
+      const parts2 = imagePart.trim().split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
       if (parsedValue) {
         parsedValue += ",";
       }
-      for (const part of parts) {
+      for (const part of parts2) {
         const measurement = CSSValueFormatter.getMeasurement(part);
         if (!measurement && part !== "left" && part !== "right" && part !== "center") {
           return null;
@@ -19421,11 +19542,11 @@ class CSSPropertySetParser {
     const imageParts = lowerValue.split(SPLIT_COMMA_SEPARATED_WITH_PARANTHESES_REGEXP);
     let parsedValue = "";
     for (const imagePart of imageParts) {
-      const parts = imagePart.trim().split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
+      const parts2 = imagePart.trim().split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
       if (parsedValue) {
         parsedValue += ",";
       }
-      for (const part of parts) {
+      for (const part of parts2) {
         const measurement = CSSValueFormatter.getMeasurement(part);
         if (!measurement && part !== "top" && part !== "bottom" && part !== "center") {
           return null;
@@ -19471,9 +19592,9 @@ class CSSPropertySetParser {
     if (CSSValueFormatter.getGlobal(lowerValue) || lowerValue === "none") {
       return { "background-image": { value: lowerValue, important } };
     }
-    const parts = CSSStringUtility.splitByComma(value2);
+    const parts2 = CSSStringUtility.splitByComma(value2);
     const parsed = [];
-    for (const part of parts) {
+    for (const part of parts2) {
       const parsedValue = CSSValueFormatter.getURL(part.trim()) || CSSValueFormatter.getGradient(part.trim());
       if (!parsedValue) {
         return null;
@@ -19549,12 +19670,12 @@ class CSSPropertySetParser {
       ...this.getFontStretch("normal", important),
       ...this.getLineHeight("normal", important)
     };
-    const parts = value2.replace(/\s*\/\s*/g, "/").split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
-    for (let i = 0, max = parts.length; i < max; i++) {
-      const part = parts[i];
+    const parts2 = value2.replace(/\s*\/\s*/g, "/").split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
+    for (let i = 0, max = parts2.length; i < max; i++) {
+      const part = parts2[i];
       if (part.includes("/")) {
-        const [size, height2] = part.split("/");
-        const fontSize = this.getFontSize(size, important);
+        const [size2, height2] = part.split("/");
+        const fontSize = this.getFontSize(size2, important);
         const lineHeight = this.getLineHeight(height2, important);
         if (!fontSize || !lineHeight) {
           return null;
@@ -19577,7 +19698,7 @@ class CSSPropertySetParser {
         } else if (fontStretch) {
           Object.assign(properties2, fontStretch);
         } else {
-          const fontFamilyValue = parts.slice(i).join(" ");
+          const fontFamilyValue = parts2.slice(i).join(" ");
           const fontFamily = this.getFontFamily(fontFamilyValue, important);
           if (!fontFamily) {
             return null;
@@ -19605,9 +19726,9 @@ class CSSPropertySetParser {
     if (CSSValueFormatter.getGlobal(lowerValue) || FONT_STYLE.includes(lowerValue)) {
       return { "font-style": { value: lowerValue, important } };
     }
-    const parts = value2.split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
-    if (parts.length === 2 && parts[0] === "oblique") {
-      const degree = CSSValueFormatter.getDegree(parts[1]);
+    const parts2 = value2.split(SPLIT_SPACE_SEPARATED_WITH_PARANTHESES_REGEXP);
+    if (parts2.length === 2 && parts2[0] === "oblique") {
+      const degree = CSSValueFormatter.getDegree(parts2[1]);
       return degree ? { "font-style": { value: lowerValue, important } } : null;
     }
     return null;
@@ -19719,11 +19840,11 @@ class CSSPropertySetParser {
     if (globalValue) {
       return { "font-family": { value: globalValue, important } };
     }
-    const parts = value2.split(",");
+    const parts2 = value2.split(",");
     let parsedValue = "";
     let endWithApostroph = false;
-    for (let i = 0, max = parts.length; i < max; i++) {
-      let trimmedPart = parts[i].trim().replace(/'/g, '"');
+    for (let i = 0, max = parts2.length; i < max; i++) {
+      let trimmedPart = parts2[i].trim().replace(/'/g, '"');
       if (!trimmedPart) {
         return null;
       }
@@ -20099,13 +20220,13 @@ class CSSPropertyGetParser {
     }
     const positionX = properties2["background-position-x"].value.replace(/ *, */g, ",").split(",");
     const positionY = properties2["background-position-y"].value.replace(/ *, */g, ",").split(",");
-    const parts = [];
+    const parts2 = [];
     for (let i = 0; i < positionX.length; i++) {
-      parts.push(`${positionX[i]} ${positionY[i]}`);
+      parts2.push(`${positionX[i]} ${positionY[i]}`);
     }
     return {
       important,
-      value: parts.join(", ")
+      value: parts2.join(", ")
     };
   }
   /**
@@ -20423,6 +20544,7 @@ const CSSPropertyList = {
     "fill-opacity": "fillOpacity",
     "fill-rule": "fillRule",
     filter: "filter",
+    "fit-tolerance": "fitTolerance",
     "flex-basis": "flexBasis",
     "flex-direction": "flexDirection",
     "flex-grow": "flexGrow",
@@ -20432,7 +20554,6 @@ const CSSPropertyList = {
     float: "float",
     "flood-color": "floodColor",
     "flood-opacity": "floodOpacity",
-    "flow-tolerance": "flowTolerance",
     "frame-sizing": "frameSizing",
     "grid-auto-columns": "gridAutoColumns",
     "grid-auto-flow": "gridAutoFlow",
@@ -20781,24 +20902,32 @@ const CSSPropertyList = {
     border: "border",
     "border-block": "borderBlock",
     "border-block-color": "borderBlockColor",
+    "border-block-end-radius": "borderBlockEndRadius",
     "border-block-end": "borderBlockEnd",
+    "border-block-start-radius": "borderBlockStartRadius",
     "border-block-start": "borderBlockStart",
     "border-block-style": "borderBlockStyle",
     "border-block-width": "borderBlockWidth",
+    "border-bottom-radius": "borderBottomRadius",
     "border-bottom": "borderBottom",
     "border-color": "borderColor",
     "border-image": "borderImage",
     "border-inline": "borderInline",
     "border-inline-color": "borderInlineColor",
+    "border-inline-end-radius": "borderInlineEndRadius",
     "border-inline-end": "borderInlineEnd",
+    "border-inline-start-radius": "borderInlineStartRadius",
     "border-inline-start": "borderInlineStart",
     "border-inline-style": "borderInlineStyle",
     "border-inline-width": "borderInlineWidth",
+    "border-left-radius": "borderLeftRadius",
     "border-left": "borderLeft",
     "border-radius": "borderRadius",
+    "border-right-radius": "borderRightRadius",
     "border-right": "borderRight",
     "border-spacing": "borderSpacing",
     "border-style": "borderStyle",
+    "border-top-radius": "borderTopRadius",
     "border-top": "borderTop",
     "border-width": "borderWidth",
     "column-rule-inset-cap": "columnRuleInsetCap",
@@ -21058,6 +21187,7 @@ const CSSPropertyList = {
     fillOpacity: "fill-opacity",
     fillRule: "fill-rule",
     filter: "filter",
+    fitTolerance: "fit-tolerance",
     flexBasis: "flex-basis",
     flexDirection: "flex-direction",
     flexGrow: "flex-grow",
@@ -21067,7 +21197,6 @@ const CSSPropertyList = {
     float: "float",
     floodColor: "flood-color",
     floodOpacity: "flood-opacity",
-    flowTolerance: "flow-tolerance",
     frameSizing: "frame-sizing",
     gridAutoColumns: "grid-auto-columns",
     gridAutoFlow: "grid-auto-flow",
@@ -21416,24 +21545,32 @@ const CSSPropertyList = {
     border: "border",
     borderBlock: "border-block",
     borderBlockColor: "border-block-color",
+    borderBlockEndRadius: "border-block-end-radius",
     borderBlockEnd: "border-block-end",
+    borderBlockStartRadius: "border-block-start-radius",
     borderBlockStart: "border-block-start",
     borderBlockStyle: "border-block-style",
     borderBlockWidth: "border-block-width",
+    borderBottomRadius: "border-bottom-radius",
     borderBottom: "border-bottom",
     borderColor: "border-color",
     borderImage: "border-image",
     borderInline: "border-inline",
     borderInlineColor: "border-inline-color",
+    borderInlineEndRadius: "border-inline-end-radius",
     borderInlineEnd: "border-inline-end",
+    borderInlineStartRadius: "border-inline-start-radius",
     borderInlineStart: "border-inline-start",
     borderInlineStyle: "border-inline-style",
     borderInlineWidth: "border-inline-width",
+    borderLeftRadius: "border-left-radius",
     borderLeft: "border-left",
     borderRadius: "border-radius",
+    borderRightRadius: "border-right-radius",
     borderRight: "border-right",
     borderSpacing: "border-spacing",
     borderStyle: "border-style",
+    borderTopRadius: "border-top-radius",
     borderTop: "border-top",
     borderWidth: "border-width",
     columnRuleInsetCap: "column-rule-inset-cap",
@@ -22871,11 +23008,11 @@ class SelectorItem {
         }
         return null;
       case "target":
-        const hash = element2[ownerDocument].location.hash;
-        if (!hash) {
+        const hash2 = element2[ownerDocument].location.hash;
+        if (!hash2) {
           return null;
         }
-        return element2.isConnected && element2.id === hash.slice(1) ? { priorityWeight: 10 } : null;
+        return element2.isConnected && element2.id === hash2.slice(1) ? { priorityWeight: 10 } : null;
       case "is":
         let priorityWeightForIs = 0;
         if (!pseudo.selectorItems) {
@@ -23488,16 +23625,16 @@ class SelectorParser {
     } else if (args === "even") {
       return NTH_FUNCTION.even;
     }
-    const parts = args.replace(SPACE_REGEXP$2, "").split("n");
-    let partA = parseInt(parts[0], 10) || 0;
-    if (parts[0] == "-") {
+    const parts2 = args.replace(SPACE_REGEXP$2, "").split("n");
+    let partA = parseInt(parts2[0], 10) || 0;
+    if (parts2[0] == "-") {
       partA = -1;
     }
-    if (parts.length === 1) {
+    if (parts2.length === 1) {
       return (n) => n == partA;
     }
-    let partB = parseInt(parts[1], 10) || 0;
-    if (parts[0] == "+") {
+    let partB = parseInt(parts2[1], 10) || 0;
+    if (parts2[0] == "+") {
       partB = 1;
     }
     if (partA >= 1 || partA <= -1) {
@@ -23512,7 +23649,7 @@ class SelectorParser {
       }
       return (n) => n < partB + 1 && (n + -1 * partB) % partA === 0;
     }
-    if (parts[0]) {
+    if (parts2[0]) {
       return (n) => n === partB;
     }
     return (n) => n > partB - 1;
@@ -27846,8 +27983,8 @@ class CookieStringUtility {
    * @returns Cookie.
    */
   static stringToCookie(originURL, cookieString) {
-    const parts = cookieString.split(";");
-    const part = parts.shift();
+    const parts2 = cookieString.split(";");
+    const part = parts2.shift();
     if (!part) {
       return null;
     }
@@ -27863,7 +28000,7 @@ class CookieStringUtility {
     if (!cookie.key) {
       return null;
     }
-    for (const part2 of parts) {
+    for (const part2 of parts2) {
       const index3 = part2.indexOf("=");
       const key2 = index3 !== -1 ? part2.slice(0, index3).trim().toLowerCase() : part2.trim().toLowerCase();
       const value3 = index3 !== -1 ? part2.slice(index3 + 1).trim() : "";
@@ -28807,8 +28944,8 @@ class VirtualServerUtility {
           }
         }
         if (baseURL) {
-          const path = requestURL.slice(baseURL.href.length).split("?")[0].split("#")[0];
-          return Path.join(Path.resolve(virtualServer.directory), path.replaceAll("/", Path.sep));
+          const path2 = requestURL.slice(baseURL.href.length).split("?")[0].split("#")[0];
+          return Path.join(Path.resolve(virtualServer.directory), path2.replaceAll("/", Path.sep));
         }
       }
     }
@@ -28816,8 +28953,8 @@ class VirtualServerUtility {
       const moduleUrl = browserSettings.module.resolveNodeModules.url;
       const url2 = new URL(moduleUrl[moduleUrl.length - 1] === "/" ? moduleUrl.slice(0, -1) : moduleUrl, window2.location.origin);
       if (requestURL.startsWith(url2.href)) {
-        const path = requestURL.slice(url2.href.length).split("?")[0].split("#")[0];
-        return Path.join(Path.resolve(browserSettings.module.resolveNodeModules.directory), path.replaceAll("/", Path.sep));
+        const path2 = requestURL.slice(url2.href.length).split("?")[0].split("#")[0];
+        return Path.join(Path.resolve(browserSettings.module.resolveNodeModules.directory), path2.replaceAll("/", Path.sep));
       }
     }
     return null;
@@ -29493,6 +29630,9 @@ class Fetch {
           return true;
         }
         const headers2 = new this.#window.Headers(this.request.headers);
+        if (FetchCORSUtility.isCORS(this.request.url, locationURL)) {
+          headers2.delete("authorization");
+        }
         const requestInit = {
           method: this.request.method,
           signal: this.request.signal,
@@ -29582,6 +29722,25 @@ var HistoryScrollRestorationEnum;
 const HistoryScrollRestorationEnum$1 = HistoryScrollRestorationEnum;
 class BrowserFrameURL {
   /**
+   * Returns whether a target URL has the same origin as the origin URL.
+   *
+   * @param originURL Origin URL.
+   * @param targetURL Target URL.
+   * @returns Whether the URLs have the same origin.
+   */
+  static isSameOrigin(originURL, targetURL) {
+    return this.hasInheritedOrigin(targetURL) || targetURL.origin !== "null" && originURL.origin === targetURL.origin;
+  }
+  /**
+   * Returns whether a target URL has an opaque origin instead of an inherited origin.
+   *
+   * @param targetURL Target URL.
+   * @returns Whether the URL has an opaque origin.
+   */
+  static hasOpaqueOrigin(targetURL) {
+    return targetURL.origin === "null" && !this.hasInheritedOrigin(targetURL);
+  }
+  /**
    * Returns relative URL.
    *
    * @param frame Frame.
@@ -29598,6 +29757,15 @@ class BrowserFrameURL {
     } catch (e) {
       return new URL$2("about:blank");
     }
+  }
+  /**
+   * Returns whether a target URL has an inherited origin.
+   *
+   * @param targetURL Target URL.
+   * @returns Whether the URL has an inherited origin.
+   */
+  static hasInheritedOrigin(targetURL) {
+    return targetURL.protocol === "javascript:" || targetURL.protocol === "about:" && (targetURL.pathname === "blank" || targetURL.pathname === "srcdoc");
   }
 }
 class History {
@@ -29857,14 +30025,14 @@ class Location {
    *
    * @param hash Value.
    */
-  set hash(hash) {
+  set hash(hash2) {
     const history$1 = this.#browserFrame?.[history];
     if (!history$1 || !this.#browserFrame) {
       return;
     }
     const url2 = new URL(this.#url.href);
     const oldHash = this.#url.hash;
-    url2.hash = hash;
+    url2.hash = hash2;
     if (url2.hash !== oldHash) {
       history$1.currentItem.popState = true;
       history$1.push({
@@ -32658,13 +32826,13 @@ class DOMTokenList {
    * @param newToken NewToken.
    */
   replace(token, newToken) {
-    const list = this[getTokenList]().slice();
-    const index2 = list.indexOf(token);
+    const list2 = this[getTokenList]().slice();
+    const index2 = list2.indexOf(token);
     if (index2 === -1) {
       return false;
     }
-    list[index2] = newToken;
-    this[ownerElement].setAttribute(this[attributeName], list.join(" "));
+    list2[index2] = newToken;
+    this[ownerElement].setAttribute(this[attributeName], list2.join(" "));
     return true;
   }
   /**
@@ -32714,15 +32882,15 @@ class DOMTokenList {
    * @param tokens Tokens.
    */
   add(...tokens) {
-    const list = this[getTokenList]().slice();
-    const existingTokens = new Set(list);
+    const list2 = this[getTokenList]().slice();
+    const existingTokens = new Set(list2);
     for (const token of tokens) {
       if (!existingTokens.has(token)) {
         existingTokens.add(token);
-        list.push(token);
+        list2.push(token);
       }
     }
-    this[ownerElement].setAttribute(this[attributeName], list.join(" "));
+    this[ownerElement].setAttribute(this[attributeName], list2.join(" "));
   }
   /**
    * Removes tokens.
@@ -32730,9 +32898,9 @@ class DOMTokenList {
    * @param tokens Tokens.
    */
   remove(...tokens) {
-    const list = this[getTokenList]();
+    const list2 = this[getTokenList]();
     const tokensToRemove = new Set(tokens);
-    const newList = list.filter((item) => !tokensToRemove.has(item));
+    const newList = list2.filter((item) => !tokensToRemove.has(item));
     this[ownerElement].setAttribute(this[attributeName], newList.join(" "));
   }
   /**
@@ -36848,11 +37016,11 @@ class DOMStringMapUtility {
    * @returns Camel cased string.
    */
   static kebabToCamelCase(text2) {
-    const parts = text2.split("-");
-    for (let i = 0, max = parts.length; i < max; i++) {
-      parts[i] = i > 0 ? parts[i].charAt(0).toUpperCase() + parts[i].slice(1) : parts[i];
+    const parts2 = text2.split("-");
+    for (let i = 0, max = parts2.length; i < max; i++) {
+      parts2[i] = i > 0 ? parts2[i].charAt(0).toUpperCase() + parts2[i].slice(1) : parts2[i];
     }
-    return parts.join("");
+    return parts2.join("");
   }
   /**
    * Transforms a camel cased string to kebab case.
@@ -38079,14 +38247,14 @@ class HTMLHyperlinkElementUtility {
    *
    * @param hash Hash.
    */
-  setHash(hash) {
+  setHash(hash2) {
     let url2;
     try {
       url2 = new URL(this.getHref());
     } catch (e) {
       return;
     }
-    url2.hash = hash;
+    url2.hash = hash2;
     this.element.setAttribute("href", url2.href);
   }
 }
@@ -38122,8 +38290,8 @@ class HTMLAnchorElement extends HTMLElement {
    *
    * @param hash Hash.
    */
-  set hash(hash) {
-    this.#htmlHyperlinkElementUtility.setHash(hash);
+  set hash(hash2) {
+    this.#htmlHyperlinkElementUtility.setHash(hash2);
   }
   /**
    * Returns href.
@@ -38503,8 +38671,8 @@ class HTMLAreaElement extends HTMLElement {
    *
    * @param shape Shape.
    */
-  set shape(shape) {
-    this.setAttribute("shape", shape);
+  set shape(shape2) {
+    this.setAttribute("shape", shape2);
   }
   /**
    * Returns download.
@@ -38770,8 +38938,8 @@ class HTMLAreaElement extends HTMLElement {
    *
    * @param hash Hash.
    */
-  set hash(hash) {
-    this.#htmlHyperlinkElementUtility.setHash(hash);
+  set hash(hash2) {
+    this.#htmlHyperlinkElementUtility.setHash(hash2);
   }
   /**
    * @override
@@ -41201,6 +41369,118 @@ class BrowserFrameValidator {
     return true;
   }
 }
+class CrossOriginBrowserWindow extends EventTarget$1 {
+  window = this;
+  location;
+  // Internal properties
+  [self$1] = this;
+  // Private properties
+  #targetWindow;
+  /**
+   * Constructor.
+   *
+   * @param target Target window.
+   * @param [parent] Parent window.
+   */
+  constructor(target2, parent$1) {
+    super();
+    this[parent] = parent$1 ?? this;
+    this[top] = parent$1 ?? this;
+    this.location = new Proxy({}, {
+      get: () => {
+        throw new DOMException$1(`Blocked a frame with origin "${this.parent.location.origin}" from accessing a cross-origin frame.`, DOMExceptionNameEnum$1.securityError);
+      },
+      set: () => {
+        throw new DOMException$1(`Blocked a frame with origin "${this.parent.location.origin}" from accessing a cross-origin frame.`, DOMExceptionNameEnum$1.securityError);
+      }
+    });
+    this.#targetWindow = target2;
+  }
+  /**
+   * Returns self.
+   *
+   * @returns Self.
+   */
+  get self() {
+    return this[self$1];
+  }
+  /**
+   * Returns self.
+   *
+   * @param self Self.
+   */
+  set self(self2) {
+    this[self$1] = self2;
+  }
+  /**
+   * Returns top.
+   *
+   * @returns Top.
+   */
+  get top() {
+    return this[top];
+  }
+  /**
+   * Returns parent.
+   *
+   * @returns Parent.
+   */
+  get parent() {
+    return this[parent];
+  }
+  /**
+   * Returns parent.
+   *
+   * @param parent Parent.
+   */
+  set parent(parent$1) {
+    this[parent] = parent$1;
+  }
+  /**
+   * Returns the opener.
+   *
+   * @returns Opener.
+   */
+  get opener() {
+    return this.#targetWindow.opener;
+  }
+  /**
+   * Returns the closed state.
+   *
+   * @returns Closed state.
+   */
+  get closed() {
+    return this.#targetWindow.closed;
+  }
+  /**
+   * Shifts focus away from the window.
+   */
+  blur() {
+    this.#targetWindow.blur();
+  }
+  /**
+   * Gives focus to the window.
+   */
+  focus() {
+    this.#targetWindow.focus();
+  }
+  /**
+   * Closes the window.
+   */
+  close() {
+    this.#targetWindow.close();
+  }
+  /**
+   * Safely enables cross-origin communication between Window objects; e.g., between a page and a pop-up that it spawned, or between a page and an iframe embedded within it.
+   *
+   * @param message Message.
+   * @param [targetOrigin=*] Target origin.
+   * @param transfer Transfer. Not implemented.
+   */
+  postMessage(message, targetOrigin = "*", transfer) {
+    this.#targetWindow.postMessage(message, targetOrigin, transfer);
+  }
+}
 class BrowserFrameNavigator {
   /**
    * Navigates to a page.
@@ -41304,9 +41584,16 @@ class BrowserFrameNavigator {
     const topWindow = frame.page.mainFrame.window;
     frame[asyncTaskManager] = new AsyncTaskManager(frame);
     frame.window = new windowClass(frame, { url: targetURL.href, width: width2, height: height2 });
-    frame.window[parent] = parentWindow;
-    frame.window[top] = topWindow;
     frame.window.devicePixelRatio = devicePixelRatio;
+    if (BrowserFrameURL.hasOpaqueOrigin(targetURL)) {
+      const opaqueOriginParentWindow = new CrossOriginBrowserWindow(parentWindow);
+      const opaqueOriginTopWindow = parentWindow === topWindow ? opaqueOriginParentWindow : new CrossOriginBrowserWindow(topWindow);
+      frame.window[parent] = opaqueOriginParentWindow;
+      frame.window[top] = opaqueOriginTopWindow;
+    } else {
+      frame.window[parent] = parentWindow;
+      frame.window[top] = topWindow;
+    }
     if (exceptionObserver$1) {
       exceptionObserver$1.observe(frame.window);
     }
@@ -41379,7 +41666,7 @@ class BrowserFrameNavigator {
       if (frame.parentFrame) {
         const originURL = frame.parentFrame.window.location;
         const xFrameOptions = response.headers?.get("X-Frame-Options")?.toLowerCase();
-        const isSameOrigin = originURL.origin === targetURL.origin || targetURL.origin === "null";
+        const isSameOrigin = BrowserFrameURL.isSameOrigin(originURL, targetURL);
         if (xFrameOptions === "deny" || xFrameOptions === "sameorigin" && !isSameOrigin) {
           throw new Error(`Refused to display '${url2}' in a frame because it set 'X-Frame-Options' to '${xFrameOptions}'.`);
         }
@@ -41533,8 +41820,8 @@ class BrowserFrameNavigator {
     const { windowClass, frame, goToOptions, steps } = options2;
     const history$1 = frame[history];
     const fromIndex = history$1.items.indexOf(history$1.currentItem);
-    const toIndex = fromIndex + steps;
-    const historyItem = history$1.items[toIndex];
+    const toIndex2 = fromIndex + steps;
+    const historyItem = history$1.items[toIndex2];
     if (!historyItem) {
       return new Promise((resolve2) => {
         frame.window.requestAnimationFrame(() => {
@@ -41550,14 +41837,14 @@ class BrowserFrameNavigator {
     const fromOrigin = new URL(history$1.currentItem.href).origin;
     let isPopState = true;
     if (steps < 0) {
-      for (let i = fromIndex; i > toIndex; i--) {
+      for (let i = fromIndex; i > toIndex2; i--) {
         if (!history$1.items[i].popState || fromOrigin !== new URL(history$1.items[i].href).origin) {
           isPopState = false;
           break;
         }
       }
     } else {
-      for (let i = fromIndex; i < toIndex; i++) {
+      for (let i = fromIndex; i < toIndex2; i++) {
         if (!history$1.items[i].popState || fromOrigin !== new URL(history$1.items[i].href).origin) {
           isPopState = false;
           break;
@@ -42170,118 +42457,6 @@ class HTMLHRElement extends HTMLElement {
 }
 class HTMLHtmlElement extends HTMLElement {
 }
-class CrossOriginBrowserWindow extends EventTarget$1 {
-  window = this;
-  location;
-  // Internal properties
-  [self$1] = this;
-  // Private properties
-  #targetWindow;
-  /**
-   * Constructor.
-   *
-   * @param target Target window.
-   * @param [parent] Parent window.
-   */
-  constructor(target2, parent$1) {
-    super();
-    this[parent] = parent$1 ?? this;
-    this[top] = parent$1 ?? this;
-    this.location = new Proxy({}, {
-      get: () => {
-        throw new DOMException$1(`Blocked a frame with origin "${this.parent.location.origin}" from accessing a cross-origin frame.`, DOMExceptionNameEnum$1.securityError);
-      },
-      set: () => {
-        throw new DOMException$1(`Blocked a frame with origin "${this.parent.location.origin}" from accessing a cross-origin frame.`, DOMExceptionNameEnum$1.securityError);
-      }
-    });
-    this.#targetWindow = target2;
-  }
-  /**
-   * Returns self.
-   *
-   * @returns Self.
-   */
-  get self() {
-    return this[self$1];
-  }
-  /**
-   * Returns self.
-   *
-   * @param self Self.
-   */
-  set self(self2) {
-    this[self$1] = self2;
-  }
-  /**
-   * Returns top.
-   *
-   * @returns Top.
-   */
-  get top() {
-    return this[top];
-  }
-  /**
-   * Returns parent.
-   *
-   * @returns Parent.
-   */
-  get parent() {
-    return this[parent];
-  }
-  /**
-   * Returns parent.
-   *
-   * @param parent Parent.
-   */
-  set parent(parent$1) {
-    this[parent] = parent$1;
-  }
-  /**
-   * Returns the opener.
-   *
-   * @returns Opener.
-   */
-  get opener() {
-    return this.#targetWindow.opener;
-  }
-  /**
-   * Returns the closed state.
-   *
-   * @returns Closed state.
-   */
-  get closed() {
-    return this.#targetWindow.closed;
-  }
-  /**
-   * Shifts focus away from the window.
-   */
-  blur() {
-    this.#targetWindow.blur();
-  }
-  /**
-   * Gives focus to the window.
-   */
-  focus() {
-    this.#targetWindow.focus();
-  }
-  /**
-   * Closes the window.
-   */
-  close() {
-    this.#targetWindow.close();
-  }
-  /**
-   * Safely enables cross-origin communication between Window objects; e.g., between a page and a pop-up that it spawned, or between a page and an iframe embedded within it.
-   *
-   * @param message Message.
-   * @param [targetOrigin=*] Target origin.
-   * @param transfer Transfer. Not implemented.
-   */
-  postMessage(message, targetOrigin = "*", transfer) {
-    this.#targetWindow.postMessage(message, targetOrigin, transfer);
-  }
-}
 const SANDBOX_FLAGS = [
   "allow-downloads",
   "allow-forms",
@@ -42596,7 +42771,7 @@ class HTMLIFrameElement extends HTMLElement {
       this.dispatchEvent(new Event2("error"));
       return;
     }
-    const isSameOrigin = originURL.origin === targetURL.origin || targetURL.origin === "null";
+    const isSameOrigin = BrowserFrameURL.isSameOrigin(originURL, targetURL);
     const parentWindow = isSameOrigin ? window2 : new CrossOriginBrowserWindow(window2);
     this.#iframe = this.#iframe ?? BrowserFrameFactory.createChildFrame(browserFrame);
     this.#iframe.window[top] = parentWindow;
@@ -43064,10 +43239,10 @@ function requireLib() {
   function lookup(buffer2) {
     var type2 = detector2(buffer2);
     if (type2 in typeHandlers) {
-      var size = typeHandlers[type2].calculate(buffer2);
-      if (size !== false) {
-        size.type = type2;
-        return size;
+      var size2 = typeHandlers[type2].calculate(buffer2);
+      if (size2 !== false) {
+        size2.type = type2;
+        return size2;
       }
     }
     throw new TypeError("unsupported file type: " + type2);
@@ -43647,8 +43822,8 @@ class HTMLInputElementValueSanitizer {
    */
   static lastIsoWeekOfYear = (year) => {
     const date2 = new Date(+year, 11, 31);
-    const day = (date2.getDay() + 6) % 7;
-    date2.setDate(date2.getDate() - day + 3);
+    const day2 = (date2.getDay() + 6) % 7;
+    date2.setDate(date2.getDate() - day2 + 3);
     const firstThursday = date2.getTime();
     date2.setMonth(0, 1);
     if (date2.getDay() !== 4) {
@@ -44088,9 +44263,9 @@ class HTMLInputElement extends HTMLElement {
    * @returns Size.
    */
   get size() {
-    const size = this.getAttribute("size");
-    if (size !== null) {
-      return parseInt(size);
+    const size2 = this.getAttribute("size");
+    if (size2 !== null) {
+      return parseInt(size2);
     }
     return 20;
   }
@@ -44099,8 +44274,8 @@ class HTMLInputElement extends HTMLElement {
    *
    * @param size Size.
    */
-  set size(size) {
-    this.setAttribute("size", String(size));
+  set size(size2) {
+    this.setAttribute("size", String(size2));
   }
   /**
    * Returns minlength.
@@ -44735,8 +44910,8 @@ class HTMLInputElement extends HTMLElement {
           return NaN;
         }
         const d = new Date(Date.UTC(parseInt(match[1], 10), 0));
-        const day = d.getUTCDay();
-        const diff = ((day === 0 ? -6 : 1) - day) * 864e5 + parseInt(match[2], 10) * 6048e5;
+        const day2 = d.getUTCDay();
+        const diff = ((day2 === 0 ? -6 : 1) - day2) * 864e5 + parseInt(match[2], 10) * 6048e5;
         return d.getTime() + diff;
       }
       default:
@@ -45709,6 +45884,9 @@ class SyncFetch {
           throw new this.#window.DOMException(`Maximum redirects reached at: ${this.request.url}`, DOMExceptionNameEnum$1.networkError);
         }
         const headers2 = new this.#window.Headers(this.request.headers);
+        if (FetchCORSUtility.isCORS(this.request.url, locationURL)) {
+          headers2.delete("authorization");
+        }
         const requestInit = {
           method: this.request.method,
           signal: this.request.signal,
@@ -46093,12 +46271,12 @@ class ModuleURLUtility {
     const slash = resolveNodeModules.url[resolveNodeModules.url.length - 1] === "/" ? "" : "/";
     const baseURL = `${resolveNodeModules.url}${slash}`;
     const nodeModulesDirectory = Path.resolve(resolveNodeModules.directory);
-    const parts = url2.split("/");
+    const parts2 = url2.split("/");
     const cached2 = this.nodeModuleResolveCache.get(url2);
     if (cached2) {
       return cached2;
     }
-    const packageName = url2[0] === "@" ? `${parts[0]}/${parts[1]}` : parts[0];
+    const packageName = url2[0] === "@" ? `${parts2[0]}/${parts2[1]}` : parts2[0];
     let packageJson = this.packageJsonCache.get(packageName);
     if (!packageJson) {
       try {
@@ -46108,7 +46286,7 @@ class ModuleURLUtility {
         return url2;
       }
     }
-    if (url2[0] === "@" && parts.length === 2 || parts.length === 1) {
+    if (url2[0] === "@" && parts2.length === 2 || parts2.length === 1) {
       if (packageJson.exports?.["."]?.import) {
         const resolvedURL = `${baseURL}${packageName}/${packageJson.exports["."].import.replace("./", "")}`;
         this.nodeModuleResolveCache.set(url2, resolvedURL);
@@ -46124,7 +46302,7 @@ class ModuleURLUtility {
       }
       return url2;
     }
-    const subPath = parts.slice(url2[0] === "@" ? 2 : 1).join("/");
+    const subPath = parts2.slice(url2[0] === "@" ? 2 : 1).join("/");
     if (packageJson.exports) {
       for (const key of Object.keys(packageJson.exports)) {
         const importEntry = Array.isArray(packageJson.exports[key].import) ? packageJson.exports[key].import[0] : packageJson.exports[key].import;
@@ -46162,6 +46340,7 @@ const STATEMENT_REGEXP$1 = /import\.meta\.([a-zA-Z]+)|import\s*["']([^"']+)["'];
 const SYNTAX_REGEXP$1 = /(\/)|(\(|\))|({|})|(\[|\])|(\${)|(`)|(')|(")|(\n)/gm;
 const IMPORT_REGEXP = /{([^}]+)}|\*\s+as\s+([a-zA-Z0-9-_$]+)|([a-zA-Z0-9-_$]+)/gm;
 const VALID_VARIABLE_NAME_REGEXP = /^[a-zA-Z_$][a-zA-Z0-9_$]*$/;
+const VALID_BINDING_NAME_REGEXP = /^[\p{ID_Start}_$][\p{ID_Continue}$\u200c\u200d]*$/u;
 const PRECEDING_STATEMENT_TOKEN_REGEXP$1 = /['"`(){}\s;=><\[\]+-,:&]/;
 const PRECEDING_REGEXP_TOKEN_REGEXP$1 = /['"`({};=><\[+-,:&]/;
 const MULTILINE_COMMENT_REGEXP = /\/\*|\*\//gm;
@@ -46274,13 +46453,13 @@ class ECMAScriptModuleCompiler {
         let importMatch = null;
         while (importMatch = importRegExp.exec(variables)) {
           if (importMatch[1]) {
-            const parts = this.removeMultilineComments(importMatch[1]).split(/\s*,\s*/);
+            const parts2 = this.removeMultilineComments(importMatch[1]).split(/\s*,\s*/);
             const properties2 = [];
-            for (const part of parts) {
+            for (const part of parts2) {
               const nameParts = part.trim().split(/\s+as\s+/);
               const alias = (nameParts[1] || nameParts[0]).replace(/["']/g, "");
-              const name2 = nameParts[0].replace(/["']/g, "");
-              if (alias && name2) {
+              const name2 = nameParts[0].replace(/["'\\\r\n\u2028\u2029]/g, "");
+              if (alias && name2 && VALID_BINDING_NAME_REGEXP.test(alias)) {
                 if (name2 === alias) {
                   properties2.push({ name: name2 });
                 } else {
@@ -46291,7 +46470,7 @@ class ECMAScriptModuleCompiler {
             if (!match[7] || match[7] === "esm") {
               resolvableCircularImports.push({ url: url2, properties: properties2 });
             }
-            newCodeStart += `let {${properties2.map((property) => property.alias ? `"${property.name}": ${property.alias}` : property.name).join(", ")}} = $happy_dom.imports.get('${url2}')${match[8]}`;
+            newCodeStart += `let {${properties2.map((property) => property.alias ? `${JSON.stringify(property.name)}: ${property.alias}` : property.name).join(", ")}} = $happy_dom.imports.get('${url2}')${match[8]}`;
           } else if (importMatch[2]) {
             newCodeStart += `const ${importMatch[2]} = $happy_dom.imports.get('${url2}')${match[8]}`;
           } else if (importMatch[3]) {
@@ -46313,16 +46492,16 @@ class ECMAScriptModuleCompiler {
           newCode += `Object.assign($happy_dom.exports, $happy_dom.imports.get('${url2}'))`;
           imports.push({ url: url2, type: "esm" });
         } else if (imported[0] === "*") {
-          const parts = imported.split(/\s+as\s+/);
-          if (parts.length === 2) {
-            const exportName = parts[1].replace(/["']/g, "");
+          const parts2 = imported.split(/\s+as\s+/);
+          if (parts2.length === 2) {
+            const exportName = parts2[1].replace(/["']/g, "");
             newCode += `$happy_dom.exports['${exportName}'] = $happy_dom.imports.get('${url2}')`;
             imports.push({ url: url2, type: "esm" });
           }
         } else if (imported[0] === "{") {
-          const parts = this.removeMultilineComments(imported).slice(1, -1).split(/\s*,\s*/);
+          const parts2 = this.removeMultilineComments(imported).slice(1, -1).split(/\s*,\s*/);
           const exportCode = [];
-          for (const part of parts) {
+          for (const part of parts2) {
             const nameParts = part.trim().split(/\s+as\s+/);
             const exportName = (nameParts[1] || nameParts[0]).replace(/["']/g, "");
             const importName = nameParts[0].replace(/["']/g, "");
@@ -46355,9 +46534,9 @@ class ECMAScriptModuleCompiler {
       } else if (match[15] && isTopLevel && PRECEDING_STATEMENT_TOKEN_REGEXP$1.test(precedingToken)) {
         newCode += "$happy_dom.exports.default = ";
       } else if (match[16] && isTopLevel && PRECEDING_STATEMENT_TOKEN_REGEXP$1.test(precedingToken)) {
-        const parts = this.removeMultilineComments(match[16]).split(/\s*,\s*/);
+        const parts2 = this.removeMultilineComments(match[16]).split(/\s*,\s*/);
         const exportCode = [];
-        for (const part of parts) {
+        for (const part of parts2) {
           const nameParts = part.trim().split(/\s+as\s+/);
           const exportName = (nameParts[1] || nameParts[0]).replace(/["']/g, "");
           const importName = nameParts[0].replace(/["']/g, "");
@@ -46370,8 +46549,8 @@ class ECMAScriptModuleCompiler {
         if (match[19] === "=") {
           const exportName = this.removeMultilineComments(match[18]).trim();
           if (exportName[0] === "{" && exportName[exportName.length - 1] === "}" || exportName[0] === "[" && exportName[exportName.length - 1] === "]") {
-            const parts = exportName.slice(1, -1).split(/\s*,\s*/);
-            for (const part of parts) {
+            const parts2 = exportName.slice(1, -1).split(/\s*,\s*/);
+            for (const part of parts2) {
               const nameParts = part.trim().split(/\s*:\s*/);
               const exportName2 = (nameParts[1] || nameParts[0]).replace(/["']/g, "");
               if (exportName2) {
@@ -46387,8 +46566,8 @@ class ECMAScriptModuleCompiler {
           }
         } else {
           newCode += match[0].replace(EXPORT_REGEXP, "");
-          const parts = this.removeMultilineComments(match[18]).split(",");
-          for (const part of parts) {
+          const parts2 = this.removeMultilineComments(match[18]).split(",");
+          for (const part of parts2) {
             const exportName = part.trim();
             newCodeEnd += `$happy_dom.exports['${exportName}'] = ${exportName};
 `;
@@ -49871,8 +50050,8 @@ class HTMLSelectElement extends HTMLElement {
         }
       }
     }
-    const size = this.#getDisplaySize();
-    if (size === 1 && !selected.length) {
+    const size2 = this.#getDisplaySize();
+    if (size2 === 1 && !selected.length) {
       this[selectedIndex] = -1;
       for (let i = 0, max = options2.length; i < max; i++) {
         const option = options2[i];
@@ -49904,9 +50083,9 @@ class HTMLSelectElement extends HTMLElement {
    */
   #getDisplaySize() {
     if (this.hasAttributeNS(null, "size")) {
-      const size = parseInt(this.getAttribute("size"));
-      if (!isNaN(size) && size >= 0) {
-        return size;
+      const size2 = parseInt(this.getAttribute("size"));
+      if (!isNaN(size2) && size2 >= 0) {
+        return size2;
       }
     }
     return this.hasAttributeNS(null, "multiple") ? 4 : 1;
@@ -53977,7 +54156,7 @@ class WindowPageOpenUtility {
    * @returns Window features.
    */
   static getWindowFeatures(features) {
-    const parts = features.split(",");
+    const parts2 = features.split(",");
     const result2 = {
       popup: false,
       width: 0,
@@ -53987,7 +54166,7 @@ class WindowPageOpenUtility {
       noopener: false,
       noreferrer: false
     };
-    for (const part of parts) {
+    for (const part of parts2) {
       const [key, value2] = part.split("=");
       switch (key) {
         case "popup":
@@ -55394,9 +55573,9 @@ let Document$1 = class Document extends Node$1 {
     if (!qualifiedName) {
       throw new window2.DOMException("Failed to execute 'createElementNS' on 'Document': The qualified name provided is empty.");
     }
-    const parts = qualifiedName.split(":");
-    const localName$1 = parts[1] ?? parts[0];
-    const prefix$1 = parts[1] ? parts[0] : null;
+    const parts2 = qualifiedName.split(":");
+    const localName$1 = parts2[1] ?? parts2[0];
+    const prefix$1 = parts2[1] ? parts2[0] : null;
     switch (namespaceURI$1) {
       case NamespaceURI.svg:
         const config2 = SVGElementConfig[qualifiedName.toLowerCase()];
@@ -55522,10 +55701,10 @@ let Document$1 = class Document extends Node$1 {
   createAttribute(qualifiedName) {
     const attribute = NodeFactory.createNode(this, this[window$1].Attr);
     const name$1 = StringUtility.asciiLowerCase(qualifiedName);
-    const parts = name$1.split(":");
+    const parts2 = name$1.split(":");
     attribute[name] = name$1;
-    attribute[localName] = parts[1] ?? name$1;
-    attribute[prefix] = parts[1] ? parts[0] : null;
+    attribute[localName] = parts2[1] ?? name$1;
+    attribute[prefix] = parts2[1] ? parts2[0] : null;
     return attribute;
   }
   /**
@@ -55537,11 +55716,11 @@ let Document$1 = class Document extends Node$1 {
    */
   createAttributeNS(namespaceURI$1, qualifiedName) {
     const attribute = NodeFactory.createNode(this, this[window$1].Attr);
-    const parts = qualifiedName.split(":");
+    const parts2 = qualifiedName.split(":");
     attribute[namespaceURI] = namespaceURI$1;
     attribute[name] = qualifiedName;
-    attribute[localName] = parts[1] ?? qualifiedName;
-    attribute[prefix] = parts[1] ? parts[0] : null;
+    attribute[localName] = parts2[1] ?? qualifiedName;
+    attribute[prefix] = parts2[1] ? parts2[0] : null;
     if (!namespaceURI$1 && attribute[prefix]) {
       throw new this[window$1].DOMException(`Failed to execute 'createAttributeNS' on 'Document': The namespace URI provided ('${namespaceURI$1 || ""}') is not valid for the qualified name provided ('${qualifiedName}').`, DOMExceptionNameEnum$1.namespaceError);
     }
@@ -57296,15 +57475,15 @@ class XMLParser {
    */
   parseProcessingInstruction(text2) {
     const markupRegExp = this.markupRegExp;
-    const parts = text2.split(SPACE_REGEXP);
+    const parts2 = text2.split(SPACE_REGEXP);
     const endsWithQuestionMark = text2[text2.length - 1] === "?";
-    if (parts[0] === "xml") {
-      if (this.currentNode !== this.rootNode || this.rootNode[nodeArray].length !== 0 || parts.length === 1) {
+    if (parts2[0] === "xml") {
+      if (this.currentNode !== this.rootNode || this.rootNode[nodeArray].length !== 0 || parts2.length === 1) {
         this.errorMessage = "XML declaration allowed only at the start of the document\n";
         this.errorIndex = markupRegExp.lastIndex - text2.length + 2;
         this.readState = MarkupReadStateEnum.error;
         this.removeOverflowingTextNodes();
-      } else if (!XML_PROCESSING_INSTRUCTION_VERSION_REGEXP.test(parts[1])) {
+      } else if (!XML_PROCESSING_INSTRUCTION_VERSION_REGEXP.test(parts2[1])) {
         this.errorMessage = "Malformed declaration expecting version\n";
         this.errorIndex = markupRegExp.lastIndex - text2.length + 3;
         this.readState = MarkupReadStateEnum.error;
@@ -57313,23 +57492,23 @@ class XMLParser {
         this.errorIndex = markupRegExp.lastIndex - 1;
         this.readState = MarkupReadStateEnum.error;
       } else {
-        const name2 = parts[0];
-        const content2 = parts.slice(1).join(" ").slice(0, -1);
+        const name2 = parts2[0];
+        const content2 = parts2.slice(1).join(" ").slice(0, -1);
         this.rootNode[xmlProcessingInstruction] = this.rootNode.createProcessingInstruction(name2, content2);
         this.readState = MarkupReadStateEnum.any;
       }
     } else {
-      if (parts.length === 1 && !endsWithQuestionMark) {
+      if (parts2.length === 1 && !endsWithQuestionMark) {
         this.errorMessage = "ParsePI: PI processing-instruction space expected\n";
         this.errorIndex = markupRegExp.lastIndex - 1;
         this.readState = MarkupReadStateEnum.error;
-      } else if (parts.length > 1 && !endsWithQuestionMark) {
+      } else if (parts2.length > 1 && !endsWithQuestionMark) {
         this.errorMessage = "ParsePI: PI processing-instruction never end ...\n";
         this.errorIndex = markupRegExp.lastIndex - 1;
         this.readState = MarkupReadStateEnum.error;
       } else {
-        const name2 = parts[0];
-        const content2 = parts.slice(1).join(" ").slice(0, -1);
+        const name2 = parts2[0];
+        const content2 = parts2.slice(1).join(" ").slice(0, -1);
         this.currentNode[appendChild](this.rootNode.createProcessingInstruction(name2, content2), true);
         this.readState = MarkupReadStateEnum.any;
       }
@@ -57383,11 +57562,11 @@ class XMLParser {
    * @param tagName Tag name.
    */
   parseStartTag(tagName2) {
-    const parts = tagName2.split(":");
+    const parts2 = tagName2.split(":");
     const namespacePrefixStack = this.namespacePrefixStack;
     const defaultNamespaceStack = this.defaultNamespaceStack;
-    if (parts.length > 1) {
-      this.nextElement = this.rootNode.createElementNS(namespacePrefixStack[namespacePrefixStack.length - 1]?.get(parts[0]) || null, tagName2);
+    if (parts2.length > 1) {
+      this.nextElement = this.rootNode.createElementNS(namespacePrefixStack[namespacePrefixStack.length - 1]?.get(parts2[0]) || null, tagName2);
     } else {
       this.nextElement = this.rootNode.createElementNS(defaultNamespaceStack[defaultNamespaceStack.length - 1] || null, tagName2);
     }
@@ -59505,13 +59684,13 @@ function requireBufferUtil() {
   hasRequiredBufferUtil = 1;
   const { EMPTY_BUFFER } = requireConstants();
   const FastBuffer = Buffer[Symbol.species];
-  function concat(list, totalLength) {
-    if (list.length === 0) return EMPTY_BUFFER;
-    if (list.length === 1) return list[0];
+  function concat(list2, totalLength) {
+    if (list2.length === 0) return EMPTY_BUFFER;
+    if (list2.length === 1) return list2[0];
     const target2 = Buffer.allocUnsafe(totalLength);
     let offset2 = 0;
-    for (let i = 0; i < list.length; i++) {
-      const buf = list[i];
+    for (let i = 0; i < list2.length; i++) {
+      const buf = list2[i];
       target2.set(buf, offset2);
       offset2 += buf.length;
     }
@@ -61312,14 +61491,14 @@ function requireSender() {
      * @param {Function} [cb] Callback
      * @private
      */
-    sendFrame(list, cb) {
-      if (list.length === 2) {
+    sendFrame(list2, cb) {
+      if (list2.length === 2) {
         this._socket.cork();
-        this._socket.write(list[0]);
-        this._socket.write(list[1], cb);
+        this._socket.write(list2[0]);
+        this._socket.write(list2[1], cb);
         this._socket.uncork();
       } else {
-        this._socket.write(list[0], cb);
+        this._socket.write(list2[0], cb);
       }
     }
   }
@@ -61730,7 +61909,7 @@ function requireWebsocket() {
   const http = HTTP;
   const net = require$$3$2;
   const tls = require$$4;
-  const { randomBytes, createHash } = Crypto;
+  const { randomBytes: randomBytes2, createHash: createHash2 } = Crypto;
   const { Duplex, Readable } = Stream;
   const { URL: URL3 } = require$$7;
   const PerMessageDeflate = requirePermessageDeflate();
@@ -62268,7 +62447,7 @@ function requireWebsocket() {
       }
     }
     const defaultPort = isSecure ? 443 : 80;
-    const key = randomBytes(16).toString("base64");
+    const key = randomBytes2(16).toString("base64");
     const request = isSecure ? https.request : http.request;
     const protocolSet = /* @__PURE__ */ new Set();
     let perMessageDeflate;
@@ -62317,9 +62496,9 @@ function requireWebsocket() {
       opts.auth = `${parsedUrl.username}:${parsedUrl.password}`;
     }
     if (isIpcUrl) {
-      const parts = opts.path.split(":");
-      opts.socketPath = parts[0];
-      opts.path = parts[1];
+      const parts2 = opts.path.split(":");
+      opts.socketPath = parts2[0];
+      opts.path = parts2[1];
     }
     let req;
     if (opts.followRedirects) {
@@ -62398,7 +62577,7 @@ function requireWebsocket() {
         abortHandshake(websocket2, socket, "Invalid Upgrade header");
         return;
       }
-      const digest = createHash("sha1").update(key + GUID).digest("base64");
+      const digest = createHash2("sha1").update(key + GUID).digest("base64");
       if (res.headers["sec-websocket-accept"] !== digest) {
         abortHandshake(websocket2, socket, "Invalid Sec-WebSocket-Accept header");
         return;
@@ -62689,7 +62868,7 @@ function requireStream() {
         callback();
         if (duplex._readableState.endEmitted) duplex.destroy();
       } else {
-        ws._socket.once("finish", function finish() {
+        ws._socket.once("finish", function finish2() {
           callback();
         });
         ws.close();
@@ -62775,7 +62954,7 @@ function requireWebsocketServer() {
   const EventEmitter = require$$0$1;
   const http = HTTP;
   const { Duplex } = Stream;
-  const { createHash } = Crypto;
+  const { createHash: createHash2 } = Crypto;
   const extension2 = requireExtension();
   const PerMessageDeflate = requirePermessageDeflate();
   const subprotocol2 = requireSubprotocol();
@@ -63082,7 +63261,7 @@ function requireWebsocketServer() {
         );
       }
       if (this._state > RUNNING) return abortHandshake(socket, 503);
-      const digest = createHash("sha1").update(key + GUID).digest("base64");
+      const digest = createHash2("sha1").update(key + GUID).digest("base64");
       const headers2 = [
         "HTTP/1.1 101 Switching Protocols",
         "Upgrade: websocket",
@@ -67066,8 +67245,8 @@ class SVGRect {
     if (!attributeValue$1) {
       return 0;
     }
-    const parts = attributeValue$1.split(/\s+/);
-    const value2 = Number(parts[0]);
+    const parts2 = attributeValue$1.split(/\s+/);
+    const value2 = Number(parts2[0]);
     return isNaN(value2) ? 0 : value2;
   }
   /**
@@ -67094,8 +67273,8 @@ class SVGRect {
     if (!attributeValue$1) {
       return 0;
     }
-    const parts = attributeValue$1.split(/\s+/);
-    const value2 = Number(parts[1]);
+    const parts2 = attributeValue$1.split(/\s+/);
+    const value2 = Number(parts2[1]);
     return isNaN(value2) ? 0 : value2;
   }
   /**
@@ -67122,8 +67301,8 @@ class SVGRect {
     if (!attributeValue$1) {
       return 0;
     }
-    const parts = attributeValue$1.split(/\s+/);
-    const value2 = Number(parts[2]);
+    const parts2 = attributeValue$1.split(/\s+/);
+    const value2 = Number(parts2[2]);
     return isNaN(value2) ? 0 : value2;
   }
   /**
@@ -67150,8 +67329,8 @@ class SVGRect {
     if (!attributeValue$1) {
       return 0;
     }
-    const parts = attributeValue$1.split(/\s+/);
-    const value2 = Number(parts[3]);
+    const parts2 = attributeValue$1.split(/\s+/);
+    const value2 = Number(parts2[3]);
     return isNaN(value2) ? 0 : value2;
   }
   /**
@@ -67205,8 +67384,8 @@ class SVGPoint {
    */
   get x() {
     const attributeValue$1 = this[getAttribute] ? this[getAttribute]() : this[attributeValue];
-    const parts = (attributeValue$1 || "").split(ATTRIBUTE_SEPARATOR_REGEXP$3);
-    return !!parts[0] ? parseFloat(parts[0]) : 0;
+    const parts2 = (attributeValue$1 || "").split(ATTRIBUTE_SEPARATOR_REGEXP$3);
+    return !!parts2[0] ? parseFloat(parts2[0]) : 0;
   }
   /**
    * Sets x.
@@ -67229,8 +67408,8 @@ class SVGPoint {
    */
   get y() {
     const attributeValue$1 = this[getAttribute] ? this[getAttribute]() : this[attributeValue];
-    const parts = (attributeValue$1 || "").split(ATTRIBUTE_SEPARATOR_REGEXP$3);
-    return !!parts[1] ? parseFloat(parts[1]) : 0;
+    const parts2 = (attributeValue$1 || "").split(ATTRIBUTE_SEPARATOR_REGEXP$3);
+    return !!parts2[1] ? parseFloat(parts2[1]) : 0;
   }
   /**
    * Sets y.
@@ -69585,8 +69764,8 @@ class SVGNumberList {
     const items2 = [];
     const trimmed = attributeValue$1.trim();
     if (trimmed) {
-      const parts = trimmed.split(ATTRIBUTE_SEPARATOR_REGEXP$2);
-      for (let i = 0, max = parts.length; i < max; i++) {
+      const parts2 = trimmed.split(ATTRIBUTE_SEPARATOR_REGEXP$2);
+      for (let i = 0, max = parts2.length; i < max; i++) {
         const item = new SVGNumber(illegalConstructor, this[window$1], {
           readOnly: this[readOnly],
           getAttribute: () => item[attributeValue],
@@ -69595,7 +69774,7 @@ class SVGNumberList {
             this[setAttribute](this[cache].attributeValue);
           }
         });
-        item[attributeValue] = String(parseFloat(parts[i]));
+        item[attributeValue] = String(parseFloat(parts2[i]));
         items2.push(item);
       }
     }
@@ -73757,10 +73936,10 @@ class SVGPointList {
     const items2 = [];
     const trimmed = attributeValue$1.trim();
     if (trimmed) {
-      const parts = trimmed.split(ATTRIBUTE_SEPARATOR_REGEXP$1);
-      for (let i = 0, max = parts.length; i < max; i += 2) {
-        const x3 = parseFloat(parts[i]);
-        const y3 = parts[i + 1] !== void 0 ? " " + parseFloat(parts[i + 1]) : "";
+      const parts2 = trimmed.split(ATTRIBUTE_SEPARATOR_REGEXP$1);
+      for (let i = 0, max = parts2.length; i < max; i += 2) {
+        const x3 = parseFloat(parts2[i]);
+        const y3 = parts2[i + 1] !== void 0 ? " " + parseFloat(parts2[i + 1]) : "";
         const item = new SVGPoint(illegalConstructor, this[window$1], {
           readOnly: this[readOnly],
           getAttribute: () => item[attributeValue],
@@ -74630,8 +74809,8 @@ class SVGLengthList {
     const items2 = [];
     const trimmed = attributeValue$1.trim();
     if (trimmed) {
-      const parts = trimmed.split(ATTRIBUTE_SEPARATOR_REGEXP);
-      for (let i = 0, max = parts.length; i < max; i++) {
+      const parts2 = trimmed.split(ATTRIBUTE_SEPARATOR_REGEXP);
+      for (let i = 0, max = parts2.length; i < max; i++) {
         const item = new SVGLength(illegalConstructor, this[window$1], {
           readOnly: this[readOnly],
           getAttribute: () => item[attributeValue],
@@ -74642,7 +74821,7 @@ class SVGLengthList {
             this[setAttribute](newAttributeValue);
           }
         });
-        item[attributeValue] = parts[i];
+        item[attributeValue] = parts2[i];
         items2.push(item);
       }
     }
@@ -77773,7 +77952,7 @@ class PreflightResponseCache {
     this.#entries.clear();
   }
 }
-const PackageVersion = { version: "21.0.1" };
+const PackageVersion = { version: "21.0.4" };
 const DefaultBrowserSettings = {
   disableJavaScriptEvaluation: false,
   enableJavaScriptEvaluation: false,
@@ -78731,7 +78910,7 @@ function createExtensionPlatform() {
         await ChromeAsyncStorage.remove(key);
       }
     },
-    getAssetUrl: (path) => chrome.runtime.getURL(path)
+    getAssetUrl: (path2) => chrome.runtime.getURL(path2)
   };
 }
 let current$1 = null;
@@ -78776,7 +78955,7 @@ function createWebPlatform() {
         bag.delete(key);
       }
     },
-    getAssetUrl: (path) => "/" + path.replace(/^\//, "")
+    getAssetUrl: (path2) => "/" + path2.replace(/^\//, "")
   };
 }
 const nativeFetch = globalThis.fetch.bind(globalThis);
@@ -79176,8 +79355,8 @@ function getErrorMap() {
   return overrideErrorMap;
 }
 const makeIssue = (params) => {
-  const { data: data2, path, errorMaps, issueData } = params;
-  const fullPath = [...path, ...issueData.path || []];
+  const { data: data2, path: path2, errorMaps, issueData } = params;
+  const fullPath = [...path2, ...issueData.path || []];
   const fullIssue = {
     ...issueData,
     path: fullPath
@@ -79288,11 +79467,11 @@ var errorUtil;
   errorUtil2.toString = (message) => typeof message === "string" ? message : message?.message;
 })(errorUtil || (errorUtil = {}));
 class ParseInputLazyPath {
-  constructor(parent2, value2, path, key) {
+  constructor(parent2, value2, path2, key) {
     this._cachedPath = [];
     this.parent = parent2;
     this.data = value2;
-    this._path = path;
+    this._path = path2;
     this._key = key;
   }
   get path() {
@@ -81071,9 +81250,9 @@ let ZodObject$1 = class ZodObject extends ZodType$1 {
   _getCached() {
     if (this._cached !== null)
       return this._cached;
-    const shape = this._def.shape();
-    const keys = util$2.objectKeys(shape);
-    this._cached = { shape, keys };
+    const shape2 = this._def.shape();
+    const keys = util$2.objectKeys(shape2);
+    this._cached = { shape: shape2, keys };
     return this._cached;
   }
   _parse(input) {
@@ -81088,7 +81267,7 @@ let ZodObject$1 = class ZodObject extends ZodType$1 {
       return INVALID;
     }
     const { status, ctx } = this._processInputParams(input);
-    const { shape, keys: shapeKeys } = this._getCached();
+    const { shape: shape2, keys: shapeKeys } = this._getCached();
     const extraKeys = [];
     if (!(this._def.catchall instanceof ZodNever$1 && this._def.unknownKeys === "strip")) {
       for (const key in ctx.data) {
@@ -81099,7 +81278,7 @@ let ZodObject$1 = class ZodObject extends ZodType$1 {
     }
     const pairs = [];
     for (const key of shapeKeys) {
-      const keyValidator = shape[key];
+      const keyValidator = shape2[key];
       const value2 = ctx.data[key];
       pairs.push({
         key: { status: "valid", value: key },
@@ -81305,27 +81484,27 @@ let ZodObject$1 = class ZodObject extends ZodType$1 {
     });
   }
   pick(mask) {
-    const shape = {};
+    const shape2 = {};
     for (const key of util$2.objectKeys(mask)) {
       if (mask[key] && this.shape[key]) {
-        shape[key] = this.shape[key];
+        shape2[key] = this.shape[key];
       }
     }
     return new ZodObject({
       ...this._def,
-      shape: () => shape
+      shape: () => shape2
     });
   }
   omit(mask) {
-    const shape = {};
+    const shape2 = {};
     for (const key of util$2.objectKeys(this.shape)) {
       if (!mask[key]) {
-        shape[key] = this.shape[key];
+        shape2[key] = this.shape[key];
       }
     }
     return new ZodObject({
       ...this._def,
-      shape: () => shape
+      shape: () => shape2
     });
   }
   /**
@@ -81372,27 +81551,27 @@ let ZodObject$1 = class ZodObject extends ZodType$1 {
     return createZodEnum(util$2.objectKeys(this.shape));
   }
 };
-ZodObject$1.create = (shape, params) => {
+ZodObject$1.create = (shape2, params) => {
   return new ZodObject$1({
-    shape: () => shape,
+    shape: () => shape2,
     unknownKeys: "strip",
     catchall: ZodNever$1.create(),
     typeName: ZodFirstPartyTypeKind.ZodObject,
     ...processCreateParams(params)
   });
 };
-ZodObject$1.strictCreate = (shape, params) => {
+ZodObject$1.strictCreate = (shape2, params) => {
   return new ZodObject$1({
-    shape: () => shape,
+    shape: () => shape2,
     unknownKeys: "strict",
     catchall: ZodNever$1.create(),
     typeName: ZodFirstPartyTypeKind.ZodObject,
     ...processCreateParams(params)
   });
 };
-ZodObject$1.lazycreate = (shape, params) => {
+ZodObject$1.lazycreate = (shape2, params) => {
   return new ZodObject$1({
-    shape,
+    shape: shape2,
     unknownKeys: "strip",
     catchall: ZodNever$1.create(),
     typeName: ZodFirstPartyTypeKind.ZodObject,
@@ -81787,8 +81966,8 @@ class ZodSet extends ZodType$1 {
       maxSize: { value: maxSize, message: errorUtil.toString(message) }
     });
   }
-  size(size, message) {
-    return this.min(size, message).max(size, message);
+  size(size2, message) {
+    return this.min(size2, message).max(size2, message);
   }
   nonempty(message) {
     return this.min(1, message);
@@ -82535,15 +82714,15 @@ function mergeDefs(...defs) {
   }
   return Object.defineProperties({}, mergedDescriptors);
 }
-function esc(str) {
-  return JSON.stringify(str);
+function esc(str2) {
+  return JSON.stringify(str2);
 }
 function slugify(input) {
   return input.toLowerCase().trim().replace(/[^\w\s-]/g, "").replace(/[\s_-]+/g, "-").replace(/^-+|-+$/g, "");
 }
 const captureStackTrace = "captureStackTrace" in Error ? Error.captureStackTrace : (..._args) => {
 };
-function isObject(data2) {
+function isObject$5(data2) {
   return typeof data2 === "object" && data2 !== null && !Array.isArray(data2);
 }
 const allowsEval = /* @__PURE__ */ cached(() => {
@@ -82562,7 +82741,7 @@ const allowsEval = /* @__PURE__ */ cached(() => {
   }
 });
 function isPlainObject$1(o) {
-  if (isObject(o) === false)
+  if (isObject$5(o) === false)
     return false;
   const ctor = o.constructor;
   if (ctor === void 0)
@@ -82570,7 +82749,7 @@ function isPlainObject$1(o) {
   if (typeof ctor !== "function")
     return true;
   const prot = ctor.prototype;
-  if (isObject(prot) === false)
+  if (isObject$5(prot) === false)
     return false;
   if (Object.prototype.hasOwnProperty.call(prot, "isPrototypeOf") === false) {
     return false;
@@ -82589,8 +82768,8 @@ function shallowClone(o) {
   return o;
 }
 const propertyKeyTypes = /* @__PURE__ */ new Set(["string", "number", "symbol"]);
-function escapeRegex(str) {
-  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+function escapeRegex(str2) {
+  return str2.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 function clone(inst, def, params) {
   const cl = new inst._zod.constr(def ?? inst._zod.def);
@@ -82621,9 +82800,9 @@ function stringifyPrimitive(value2) {
     return `"${value2}"`;
   return `${value2}`;
 }
-function optionalKeys(shape) {
-  return Object.keys(shape).filter((k) => {
-    return shape[k]._zod.optin !== void 0 && shape[k]._zod.optout === "optional";
+function optionalKeys(shape2) {
+  return Object.keys(shape2).filter((k) => {
+    return shape2[k]._zod.optin !== void 0 && shape2[k]._zod.optout === "optional";
   });
 }
 const NUMBER_FORMAT_RANGES = /* @__PURE__ */ (() => ({
@@ -82672,33 +82851,33 @@ function omit$1(schema, mask) {
   mirrorShape(newShape, schema, Reflect.ownKeys(sourceShape(schema)).filter((key) => !omitted.has(key)));
   return clone(schema, mergeDefs(currDef, { shape: newShape, checks: [] }));
 }
-function extend(schema, shape) {
-  if (!isPlainObject$1(shape)) {
+function extend(schema, shape2) {
+  if (!isPlainObject$1(shape2)) {
     throw new Error("Invalid input to extend: expected a plain object");
   }
   const checks = schema._zod.def.checks;
   const hasChecks = checks && checks.length > 0;
   if (hasChecks) {
     const existingShape = sourceShape(schema);
-    for (const key of Reflect.ownKeys(shape)) {
+    for (const key of Reflect.ownKeys(shape2)) {
       if (Object.getOwnPropertyDescriptor(existingShape, key) !== void 0) {
         throw new Error("Cannot overwrite keys on object schemas containing refinements. Use `.safeExtend()` instead.");
       }
     }
   }
-  return clone(schema, mergeDefs(schema._zod.def, { shape: extended(schema, shape) }));
+  return clone(schema, mergeDefs(schema._zod.def, { shape: extended(schema, shape2) }));
 }
-function extended(schema, shape) {
+function extended(schema, shape2) {
   const newShape = {};
   mirrorShape(newShape, schema, Reflect.ownKeys(sourceShape(schema)));
-  mirrorProps(newShape, shape);
+  mirrorProps(newShape, shape2);
   return newShape;
 }
-function safeExtend(schema, shape) {
-  if (!isPlainObject$1(shape)) {
+function safeExtend(schema, shape2) {
+  if (!isPlainObject$1(shape2)) {
     throw new Error("Invalid input to safeExtend: expected a plain object");
   }
-  return clone(schema, mergeDefs(schema._zod.def, { shape: extended(schema, shape) }));
+  return clone(schema, mergeDefs(schema._zod.def, { shape: extended(schema, shape2) }));
 }
 function merge(a, b) {
   if (!b?._zod?.def) {
@@ -82760,11 +82939,11 @@ function explicitlyAborted(x3, startIndex = 0) {
   }
   return false;
 }
-function prefixIssues(path, issues) {
+function prefixIssues(path2, issues) {
   return issues.map((iss) => {
     var _a2;
     (_a2 = iss).path ?? (_a2.path = []);
-    iss.path.unshift(path);
+    iss.path.unshift(path2);
     return iss;
   });
 }
@@ -82814,13 +82993,13 @@ function finalizeIssue(iss, ctx, config2) {
   return full;
 }
 const highSurrogate = /[\uD800-\uDBFF]/;
-function codePointLength(str) {
-  const units = str.length;
-  if (!highSurrogate.test(str))
+function codePointLength(str2) {
+  const units = str2.length;
+  if (!highSurrogate.test(str2))
     return units;
   let count = units;
   for (let i = 0; i < units - 1; i++) {
-    if ((str.charCodeAt(i) & 64512) === 55296 && (str.charCodeAt(i + 1) & 64512) === 56320) {
+    if ((str2.charCodeAt(i) & 64512) === 55296 && (str2.charCodeAt(i + 1) & 64512) === 56320) {
       count--;
       i++;
     }
@@ -82876,12 +83055,12 @@ function members(proto, table) {
       defineBound(proto, key, desc.value);
   }
 }
-function own(inst, key, value2, enumerable = true) {
+function own$1(inst, key, value2, enumerable = true) {
   Object.defineProperty(inst, key, { configurable: true, writable: true, enumerable, value: value2 });
   return value2;
 }
 function hide(inst, key, value2) {
-  return own(inst, key, value2, false);
+  return own$1(inst, key, value2, false);
 }
 function derived(computes, table) {
   for (const key in computes) {
@@ -82890,10 +83069,10 @@ function derived(computes, table) {
       configurable: true,
       enumerable: true,
       get() {
-        return own(this, key, compute(this));
+        return own$1(this, key, compute(this));
       },
       set(value2) {
-        own(this, key, value2);
+        own$1(this, key, value2);
       }
     });
   }
@@ -82903,10 +83082,10 @@ function defineBound(proto, key, fn) {
   Object.defineProperty(proto, key, {
     configurable: true,
     get() {
-      return this == null ? fn : own(this, key, fn.bind(this));
+      return this == null ? fn : own$1(this, key, fn.bind(this));
     },
     set(value2) {
-      own(this, key, value2);
+      own$1(this, key, value2);
     }
   });
 }
@@ -83161,16 +83340,16 @@ function flattenError(error2, mapper = (issue2) => issue2.message) {
 }
 function formatError(error2, mapper = (issue2) => issue2.message) {
   const fieldErrors = { _errors: [] };
-  const processError = (error3, path = []) => {
+  const processError = (error3, path2 = []) => {
     for (const issue2 of error3.issues) {
       if (issue2.code === "invalid_union" && issue2.errors.length) {
-        issue2.errors.map((issues) => processError({ issues }, [...path, ...issue2.path]));
+        issue2.errors.map((issues) => processError({ issues }, [...path2, ...issue2.path]));
       } else if (issue2.code === "invalid_key") {
-        processError({ issues: issue2.issues }, [...path, ...issue2.path]);
+        processError({ issues: issue2.issues }, [...path2, ...issue2.path]);
       } else if (issue2.code === "invalid_element") {
-        processError({ issues: issue2.issues }, [...path, ...issue2.path]);
+        processError({ issues: issue2.issues }, [...path2, ...issue2.path]);
       } else {
-        const fullpath = [...path, ...issue2.path];
+        const fullpath = [...path2, ...issue2.path];
         if (fullpath.length === 0) {
           fieldErrors._errors.push(mapper(issue2));
         } else {
@@ -83771,7 +83950,7 @@ ${content2.join("\n")}
     return factory(...Object.values(this.closed));
   }
 }
-const version = {
+const version$1 = {
   major: 4,
   minor: 6,
   patch: 7
@@ -83781,7 +83960,7 @@ const $ZodType = /* @__PURE__ */ $constructor("$ZodType", (inst, def) => {
   inst ?? (inst = {});
   inst._zod.def = def;
   inst._zod.bag = inst._zod.bag || {};
-  inst._zod.version = version;
+  inst._zod.version = version$1;
   const defChecks = inst._zod.def.checks;
   const checks = inst._zod.traits.has("$ZodCheck") ? [inst, ...defChecks ?? []] : defChecks?.length ? [...defChecks] : [];
   for (const ch of checks) {
@@ -83882,7 +84061,7 @@ const $ZodType = /* @__PURE__ */ $constructor("$ZodType", (inst, def) => {
     return hide(this, "~standard", standardProps(this));
   },
   set "~standard"(value2) {
-    own(this, "~standard", value2);
+    own$1(this, "~standard", value2);
   }
 });
 const toStandardResult = (r2, ctx) => r2.issues.length ? { issues: r2.issues.map((iss) => finalizeIssue(iss, ctx, config$1())) } : { value: r2.value };
@@ -84145,10 +84324,10 @@ const $ZodCIDRv4 = /* @__PURE__ */ $constructor("$ZodCIDRv4", (inst, def) => {
   $ZodStringFormat.init(inst, def);
 });
 function isValidCIDRv6(value2) {
-  const parts = value2.split("/");
-  if (parts.length !== 2)
+  const parts2 = value2.split("/");
+  if (parts2.length !== 2)
     return false;
-  const [address, prefix2] = parts;
+  const [address, prefix2] = parts2;
   if (!prefix2)
     return false;
   const prefixNum = Number(prefix2);
@@ -84346,14 +84525,14 @@ const $ZodNever = /* @__PURE__ */ $constructor("$ZodNever", (inst, def) => {
     return payload;
   };
 });
-function capSize(inst, size) {
+function capSize(inst, size2) {
   const caps = sizeCaps(inst._zod.def.checks);
   if (!caps.length)
     return;
   const cap = Math.min(...caps.map((c) => c[0]));
   const parse2 = inst._zod.parse;
   inst._zod.parse = (payload, ctx) => {
-    const n = size(payload.value);
+    const n = size2(payload.value);
     if (n > cap && !ctx?.skipChecks && ctx?.direction !== "backward") {
       for (const [max, ch] of sizeCaps(inst._zod.def.checks)) {
         if (n > max && ch._zod.def.when(payload)) {
@@ -84531,10 +84710,10 @@ const $ZodObject = /* @__PURE__ */ $constructor("$ZodObject", (inst, def) => {
   }
   const _normalized = cached(() => normalizeDef(def));
   defineLazyInternal(inst, "propValues", (zod) => {
-    const shape = zod.def.shape;
+    const shape2 = zod.def.shape;
     const propValues = {};
-    for (const key in shape) {
-      const field = shape[key]._zod;
+    for (const key in shape2) {
+      const field = shape2[key]._zod;
       if (field.values) {
         if (!Object.prototype.hasOwnProperty.call(propValues, key)) {
           assignProp(propValues, key, /* @__PURE__ */ new Set());
@@ -84547,7 +84726,7 @@ const $ZodObject = /* @__PURE__ */ $constructor("$ZodObject", (inst, def) => {
     }
     return propValues;
   });
-  const isObject$1 = isObject;
+  const isObject2 = isObject$5;
   const catchall = def.catchall;
   let value2;
   const memo2 = globalConfig.memoizer;
@@ -84555,7 +84734,7 @@ const $ZodObject = /* @__PURE__ */ $constructor("$ZodObject", (inst, def) => {
   inst._zod.parse = (payload, ctx) => {
     value2 ?? (value2 = _normalized.value);
     const input = payload.value;
-    if (!isObject$1(input)) {
+    if (!isObject2(input)) {
       payload.issues.push({
         expected: "object",
         code: "invalid_type",
@@ -84566,7 +84745,7 @@ const $ZodObject = /* @__PURE__ */ $constructor("$ZodObject", (inst, def) => {
     }
     payload.value = memo2 ? memo2.alloc(inst, payload, {}, ctx) : {};
     const proms = [];
-    const shape = value2.shape;
+    const shape2 = value2.shape;
     const abortEarly = ctx?.abortEarly;
     let seen = payload.issues.length;
     for (const key of value2.allKeys) {
@@ -84577,7 +84756,7 @@ const $ZodObject = /* @__PURE__ */ $constructor("$ZodObject", (inst, def) => {
       }
       if (key === "__proto__")
         continue;
-      const el = shape[key];
+      const el = shape2[key];
       const optin = el._zod.optin;
       const optout = el._zod.optout;
       const r2 = el._zod.run({ value: input[key], issues: [] }, ctx);
@@ -84598,10 +84777,10 @@ const $ZodObjectJIT = /* @__PURE__ */ $constructor("$ZodObjectJIT", (inst, def) 
   const superParse = inst._zod.parse;
   const _normalized = cached(() => normalizeDef(def));
   const memo2 = globalConfig.memoizer;
-  const generateFastpass = (shape) => {
+  const generateFastpass = (shape2) => {
     const normalized = _normalized.value;
     const syms = normalized.symbolKeys;
-    const doc = new Doc(["payload", "ctx"], { shape, inst, memo: memo2, syms });
+    const doc = new Doc(["payload", "ctx"], { shape: shape2, inst, memo: memo2, syms });
     const parseStr = (k) => `shape[${k}]._zod.run({ value: input[${k}], issues: [] }, ctx)`;
     const prefixStr = (id2, k) => `
           let ${id2}_ab = false;
@@ -84628,7 +84807,7 @@ const $ZodObjectJIT = /* @__PURE__ */ $constructor("$ZodObjectJIT", (inst, def) 
       const id2 = ids[key];
       const k = typeof key === "symbol" ? `syms[${syms.indexOf(key)}]` : esc(key);
       const isPresent = `${k} in input`;
-      const schema = shape[key];
+      const schema = shape2[key];
       const optin = schema?._zod?.optin;
       const isOptionalIn = optin !== void 0;
       const isOptionalOut = schema?._zod?.optout === "optional";
@@ -84691,7 +84870,7 @@ const $ZodObjectJIT = /* @__PURE__ */ $constructor("$ZodObjectJIT", (inst, def) 
     return doc.compile();
   };
   let fastpass;
-  const isObject$1 = isObject;
+  const isObject2 = isObject$5;
   const jit = !globalConfig.jitless;
   const allowsEval$1 = allowsEval;
   const fastEnabled = jit && allowsEval$1.value;
@@ -84700,7 +84879,7 @@ const $ZodObjectJIT = /* @__PURE__ */ $constructor("$ZodObjectJIT", (inst, def) 
   inst._zod.parse = (payload, ctx) => {
     value2 ?? (value2 = _normalized.value);
     const input = payload.value;
-    if (!isObject$1(input)) {
+    if (!isObject2(input)) {
       payload.issues.push({
         expected: "object",
         code: "invalid_type",
@@ -84838,7 +85017,7 @@ const $ZodDiscriminatedUnion = /* @__PURE__ */ $constructor("$ZodDiscriminatedUn
   const disc = cached(() => discriminatorMap(def));
   inst._zod.parse = (payload, ctx) => {
     const input = payload.value;
-    if (!isObject(input)) {
+    if (!isObject$5(input)) {
       payload.issues.push({
         code: "invalid_type",
         expected: "object",
@@ -85614,7 +85793,7 @@ function isRecursive(inst, stack, resolve2) {
         result2 = answer;
     }
   };
-  const shape = (sh, spread) => {
+  const shape2 = (sh, spread) => {
     let answer = NONE;
     for (const key of Reflect.ownKeys(sh)) {
       const desc = Object.getOwnPropertyDescriptor(sh, key);
@@ -85635,7 +85814,7 @@ function isRecursive(inst, stack, resolve2) {
   switch (kind2) {
     case "object": {
       const raw = rawShape(def);
-      merge2(raw ? shape(raw) : ASSUMED);
+      merge2(raw ? shape2(raw) : ASSUMED);
       check(def.catchall);
       break;
     }
@@ -86790,15 +86969,15 @@ function foldObjects(members2) {
     for (const key in object2.properties) {
       if (Object.prototype.hasOwnProperty.call(properties2, key))
         continue;
-      const parts = [];
+      const parts2 = [];
       for (const other of objects) {
         const part = other.properties?.[key] ?? undeclaredConstraint(other);
         if (part === null || part === void 0)
           continue;
-        if (!parts.some((seen) => JSON.stringify(seen) === JSON.stringify(part)))
-          parts.push(part);
+        if (!parts2.some((seen) => JSON.stringify(seen) === JSON.stringify(part)))
+          parts2.push(part);
       }
-      const merged = parts.length === 1 ? parts[0] : foldObjects(parts) ?? { allOf: parts };
+      const merged = parts2.length === 1 ? parts2[0] : foldObjects(parts2) ?? { allOf: parts2 };
       assignProp(properties2, key, merged);
     }
     for (const key of object2.required ?? [])
@@ -87136,8 +87315,8 @@ const contributors = {
 function aggregateChecks(schema) {
   const agg = {};
   const def = schema._zod.def;
-  const list = schema._zod.traits.has("$ZodCheck") ? [schema, ...def.checks ?? []] : def.checks ?? [];
-  for (const ch of list)
+  const list2 = schema._zod.traits.has("$ZodCheck") ? [schema, ...def.checks ?? []] : def.checks ?? [];
+  for (const ch of list2)
     contributors[ch._zod.def.check]?.(agg, ch._zod.def);
   const bag = schema._zod.bag;
   if (bag.minimum !== void 0)
@@ -87410,21 +87589,21 @@ function inputOptin(schema) {
 const objectProcessor = (schema, ctx, _json, params) => {
   const json = _json;
   const def = schema._zod.def;
-  const shape = def.shape;
-  const symbolKeys = Object.getOwnPropertySymbols(shape);
+  const shape2 = def.shape;
+  const symbolKeys = Object.getOwnPropertySymbols(shape2);
   if (symbolKeys.length && handleUnrepresentable(schema, ctx, json, params, "Symbol keys cannot be represented in JSON Schema")) {
     return;
   }
   json.type = "object";
   json.properties = {};
-  for (const key in shape) {
-    assignProp(json.properties, key, processSchema(shape[key], ctx, {
+  for (const key in shape2) {
+    assignProp(json.properties, key, processSchema(shape2[key], ctx, {
       ...params,
       path: [...params.path, "properties", key]
     }));
   }
   const requiredKeys = [];
-  for (const key of Object.keys(shape)) {
+  for (const key of Object.keys(shape2)) {
     const field = def.shape[key];
     if (ctx.io === "input" ? inputOptin(field) === void 0 : field._zod.optout === void 0) {
       requiredKeys.push(key);
@@ -87831,7 +88010,7 @@ const ZodMiniType = /* @__PURE__ */ $constructor("ZodMiniType", (inst, def) => {
     return this.check;
   },
   set with(value2) {
-    own(this, "with", value2);
+    own$1(this, "with", value2);
   },
   parse(data2, params) {
     return parse$1(this, data2, params, { callee: this.parse });
@@ -87875,10 +88054,10 @@ const ZodMiniObject = /* @__PURE__ */ $constructor("ZodMiniObject", (inst, def) 
   installLazyProp(inst, "shape", (self2) => self2._zod.def.shape, false);
 });
 // @__NO_SIDE_EFFECTS__
-function object$1(shape, params) {
+function object$1(shape2, params) {
   const def = {
     type: "object",
-    shape: shape ?? {},
+    shape: shape2 ?? {},
     ...normalizeParams(params)
   };
   return new ZodMiniObject(def);
@@ -87887,16 +88066,16 @@ function isZ4Schema(s) {
   const schema = s;
   return !!schema._zod;
 }
-function objectFromShape(shape) {
-  const values2 = Object.values(shape);
+function objectFromShape(shape2) {
+  const values2 = Object.values(shape2);
   if (values2.length === 0)
     return /* @__PURE__ */ object$1({});
   const allV4 = values2.every(isZ4Schema);
   const allV3 = values2.every((s) => !isZ4Schema(s));
   if (allV4)
-    return /* @__PURE__ */ object$1(shape);
+    return /* @__PURE__ */ object$1(shape2);
   if (allV3)
-    return objectType(shape);
+    return objectType(shape2);
   throw new Error("Mixed Zod versions detected in object shape.");
 }
 function safeParse$1(schema, data2) {
@@ -87966,11 +88145,11 @@ function normalizeObjectSchema(schema) {
   }
   return void 0;
 }
-function getDotPath(path) {
-  if (path.length === 0) {
+function getDotPath(path2) {
+  if (path2.length === 0) {
     return "object root";
   }
-  return path.reduce((acc, seg, index2) => {
+  return path2.reduce((acc, seg, index2) => {
     if (index2 === 0) {
       return String(seg);
     }
@@ -88216,7 +88395,7 @@ const ZodType2 = /* @__PURE__ */ $constructor("ZodType", (inst, def) => {
     });
   },
   set "~standard"(value2) {
-    own(this, "~standard", value2);
+    own$1(this, "~standard", value2);
   },
   parse: function _parse2(data2, params) {
     return parse(this, data2, params, { callee: _parse2 });
@@ -88235,7 +88414,7 @@ const ZodType2 = /* @__PURE__ */ $constructor("ZodType", (inst, def) => {
     return this?.safeParseAsync;
   },
   set spa(value2) {
-    own(this, "spa", value2);
+    own$1(this, "spa", value2);
   },
   validate(data2, params) {
     return validate$2(this, data2, params);
@@ -88708,18 +88887,18 @@ const ZodObject2 = /* @__PURE__ */ $constructor("ZodObject", (inst, def) => {
     return required$4(ZodNonOptional, this, args[0]);
   }
 });
-function object(shape, params) {
+function object(shape2, params) {
   const def = {
     type: "object",
-    shape: shape ?? {},
+    shape: shape2 ?? {},
     ...normalizeParams(params)
   };
   return new ZodObject2(def);
 }
-function looseObject(shape, params) {
+function looseObject(shape2, params) {
   return new ZodObject2({
     type: "object",
-    shape,
+    shape: shape2,
     catchall: unknown(),
     ...normalizeParams(params)
   });
@@ -91477,9 +91656,9 @@ function parseObjectDef(def, refs) {
     properties: {}
   };
   const required2 = [];
-  const shape = def.shape();
-  for (const propName in shape) {
-    let propDef = shape[propName];
+  const shape2 = def.shape();
+  for (const propName in shape2) {
+    let propDef = shape2[propName];
     if (propDef === void 0 || propDef._def === void 0) {
       continue;
     }
@@ -91841,8 +92020,8 @@ function toJsonSchemaCompat(schema, opts) {
   });
 }
 function getMethodLiteral(schema) {
-  const shape = getObjectShape(schema);
-  const methodSchema = shape?.method;
+  const shape2 = getObjectShape(schema);
+  const methodSchema = shape2?.method;
   if (!methodSchema) {
     throw new Error("Schema is missing a method literal");
   }
@@ -92103,13 +92282,13 @@ class Protocol {
     const capturedTransport = this._transport;
     const relatedTaskId = request.params?._meta?.[RELATED_TASK_META_KEY]?.taskId;
     const sessionId = capturedTransport?.sessionId;
-    const store = this._taskStore;
+    const store2 = this._taskStore;
     let relatedTaskFound = true;
     let relatedTaskLookup;
-    if (relatedTaskId && store && this._taskMessageQueue && sessionId !== void 0) {
+    if (relatedTaskId && store2 && this._taskMessageQueue && sessionId !== void 0) {
       relatedTaskFound = false;
       relatedTaskLookup = (async () => {
-        if (!await store.getTask(relatedTaskId, sessionId)) {
+        if (!await store2.getTask(relatedTaskId, sessionId)) {
           throw new McpError(ErrorCode.InvalidParams, `Task not found: ${relatedTaskId}`);
         }
         relatedTaskFound = true;
@@ -92910,7 +93089,7 @@ function requireCode$3() {
     }
     exports._ = _;
     const plus = new _Code("+");
-    function str(strs, ...args) {
+    function str2(strs, ...args) {
       const expr = [safeStringify(strs[0])];
       let i = 0;
       while (i < args.length) {
@@ -92921,7 +93100,7 @@ function requireCode$3() {
       optimize(expr);
       return new _Code(expr);
     }
-    exports.str = str;
+    exports.str = str2;
     function addCodeArg(code2, arg) {
       if (arg instanceof _Code)
         code2.push(...arg._items);
@@ -92964,7 +93143,7 @@ function requireCode$3() {
       return;
     }
     function strConcat(c1, c2) {
-      return c2.emptyStr() ? c1 : c1.emptyStr() ? c2 : str`${c1}${c2}`;
+      return c2.emptyStr() ? c1 : c1.emptyStr() ? c2 : str2`${c1}${c2}`;
     }
     exports.strConcat = strConcat;
     function interpolate(x3) {
@@ -93874,10 +94053,10 @@ function requireUtil$1() {
   const codegen_1 = /* @__PURE__ */ requireCodegen$1();
   const code_1 = /* @__PURE__ */ requireCode$3();
   function toHash(arr) {
-    const hash = {};
+    const hash2 = {};
     for (const item of arr)
-      hash[item] = true;
-    return hash;
+      hash2[item] = true;
+    return hash2;
   }
   util$1.toHash = toHash;
   function alwaysValidSchema(it, schema) {
@@ -93930,22 +94109,22 @@ function requireUtil$1() {
     return (0, codegen_1._)`${topSchemaRef}${schemaPath}${(0, codegen_1.getProperty)(keyword2)}`;
   }
   util$1.schemaRefOrVal = schemaRefOrVal;
-  function unescapeFragment(str) {
-    return unescapeJsonPointer(decodeURIComponent(str));
+  function unescapeFragment(str2) {
+    return unescapeJsonPointer(decodeURIComponent(str2));
   }
   util$1.unescapeFragment = unescapeFragment;
-  function escapeFragment(str) {
-    return encodeURIComponent(escapeJsonPointer(str));
+  function escapeFragment(str2) {
+    return encodeURIComponent(escapeJsonPointer(str2));
   }
   util$1.escapeFragment = escapeFragment;
-  function escapeJsonPointer(str) {
-    if (typeof str == "number")
-      return `${str}`;
-    return str.replace(/~/g, "~0").replace(/\//g, "~1");
+  function escapeJsonPointer(str2) {
+    if (typeof str2 == "number")
+      return `${str2}`;
+    return str2.replace(/~/g, "~0").replace(/\//g, "~1");
   }
   util$1.escapeJsonPointer = escapeJsonPointer;
-  function unescapeJsonPointer(str) {
-    return str.replace(/~1/g, "/").replace(/~0/g, "~");
+  function unescapeJsonPointer(str2) {
+    return str2.replace(/~1/g, "/").replace(/~0/g, "~");
   }
   util$1.unescapeJsonPointer = unescapeJsonPointer;
   function eachItem(xs, f) {
@@ -94971,8 +95150,8 @@ function requireJsonSchemaTraverse$1() {
       post(schema, jsonPtr, rootSchema, parentJsonPtr, parentKeyword, parentSchema, keyIndex);
     }
   }
-  function escapeJsonPtr(str) {
-    return str.replace(/~/g, "~0").replace(/\//g, "~1");
+  function escapeJsonPtr(str2) {
+    return str2.replace(/~/g, "~0").replace(/\//g, "~1");
   }
   return jsonSchemaTraverse$1.exports;
 }
@@ -96011,28 +96190,28 @@ function requireUtils() {
       if (left.length === 1 && left[0] === "") left.length = 0;
       if (right.length === 1 && right[0] === "") right.length = 0;
     }
-    const parts = left.concat(right);
+    const parts2 = left.concat(right);
     let hextetCount = 0;
-    for (let i = 0; i < parts.length; i++) {
-      const part = parts[i];
+    for (let i = 0; i < parts2.length; i++) {
+      const part = parts2[i];
       if (part === "") return void 0;
       if (part.indexOf(".") !== -1) {
-        if (i !== parts.length - 1 || compression !== -1 && right.length === 0 || !isIPv4(part)) return void 0;
+        if (i !== parts2.length - 1 || compression !== -1 && right.length === 0 || !isIPv4(part)) return void 0;
         hextetCount += 2;
         continue;
       }
       if (!isHextet(part)) return void 0;
-      parts[i] = parseInt(part, 16).toString(16);
+      parts2[i] = parseInt(part, 16).toString(16);
       hextetCount++;
     }
     if (compression === -1) {
       if (hextetCount !== 8) return void 0;
-      return compressIPv6ZeroRun(parts);
+      return compressIPv6ZeroRun(parts2);
     }
     if (hextetCount >= 8) return void 0;
-    const expanded = parts.slice(0, left.length);
+    const expanded = parts2.slice(0, left.length);
     for (let i = hextetCount; i < 8; i++) expanded.push("0");
-    for (let i = left.length; i < parts.length; i++) expanded.push(parts[i]);
+    for (let i = left.length; i < parts2.length; i++) expanded.push(parts2[i]);
     return compressIPv6ZeroRun(expanded);
   }
   function normalizeIPv6(host2) {
@@ -96063,15 +96242,15 @@ function requireUtils() {
       isIPV6: true
     };
   }
-  function findToken(str, token) {
+  function findToken(str2, token) {
     let ind = 0;
-    for (let i = 0; i < str.length; i++) {
-      if (str[i] === token) ind++;
+    for (let i = 0; i < str2.length; i++) {
+      if (str2[i] === token) ind++;
     }
     return ind;
   }
-  function removeDotSegments(path) {
-    let input = path;
+  function removeDotSegments(path2) {
+    let input = path2;
     const output = [];
     let nextSlash = -1;
     let len = 0;
@@ -96144,6 +96323,37 @@ function requireUtils() {
       }
     }
     return output.join("");
+  }
+  function removeDotSegmentsRelative(path2) {
+    if (path2 === "" || path2[0] === "/") {
+      return removeDotSegments(path2);
+    }
+    const segments = path2.split("/");
+    const last = segments.length - 1;
+    const output = [];
+    let trailingDirectory = false;
+    for (let i = 0; i <= last; i++) {
+      const segment = segments[i];
+      if (segment === "." || segment === "..") {
+        if (segment === "..") {
+          if (output.length !== 0 && output[output.length - 1] !== "..") {
+            output.pop();
+          } else {
+            output.push("..");
+          }
+        }
+        trailingDirectory = i === last;
+      } else {
+        output.push(segment);
+      }
+    }
+    if (trailingDirectory && output[output.length - 1] !== "..") {
+      output.push("");
+    }
+    if (output.length === 0 || output[0] === "" || output[0].includes(":")) {
+      output.unshift(".");
+    }
+    return output.join("/");
   }
   const HOST_DELIMS = { "@": "%40", "/": "%2F", "?": "%3F", "#": "%23", ":": "%3A" };
   const HOST_DELIM_RE = /[@/?#:]/g;
@@ -96405,6 +96615,7 @@ function requireUtils() {
     encodeFragment,
     escapePreservingEscapes,
     removeDotSegments,
+    removeDotSegmentsRelative,
     isIPv4,
     isUUID,
     normalizeIPv6,
@@ -96480,8 +96691,8 @@ function requireSchemes() {
     }
     if (wsComponent.resourceName) {
       const queryIndex = wsComponent.resourceName.indexOf("?");
-      const path = queryIndex === -1 ? wsComponent.resourceName : wsComponent.resourceName.slice(0, queryIndex);
-      wsComponent.path = path && path !== "/" ? path : void 0;
+      const path2 = queryIndex === -1 ? wsComponent.resourceName : wsComponent.resourceName.slice(0, queryIndex);
+      wsComponent.path = path2 && path2 !== "/" ? path2 : void 0;
       wsComponent.query = queryIndex === -1 ? void 0 : wsComponent.resourceName.slice(queryIndex + 1);
       wsComponent.resourceName = void 0;
     }
@@ -96627,16 +96838,18 @@ var hasRequiredFastUri;
 function requireFastUri() {
   if (hasRequiredFastUri) return fastUri.exports;
   hasRequiredFastUri = 1;
-  const { normalizeIPv6, removeDotSegments, recomposeAuthority, normalizePercentEncoding, normalizePathEncoding, serializePathEncoding, normalizeQueryFragmentEncoding, encodeQuery, encodeFragment, reescapeHostDelimiters, isIPv4, nonSimpleDomain } = requireUtils();
+  const { normalizeIPv6, removeDotSegments, removeDotSegmentsRelative, recomposeAuthority, normalizePercentEncoding, normalizePathEncoding, serializePathEncoding, normalizeQueryFragmentEncoding, encodeQuery, encodeFragment, reescapeHostDelimiters, isIPv4, nonSimpleDomain } = requireUtils();
   const { SCHEMES, getSchemeHandler } = requireSchemes();
   const VALID_SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*$/u;
   const MALFORMED_SCHEME_ERROR = "URI scheme is malformed.";
-  function decodeValidScheme(scheme) {
-    const decodedScheme = unescape(String(scheme));
-    if (!VALID_SCHEME.test(decodedScheme)) {
+  const MALFORMED_HOST_ERROR = "URI host is malformed.";
+  const FORBIDDEN_DOMAIN_HOST_CHARACTER = /[\0-\x20"#/:<>?@[\\\]^`{|}\x7F]/u;
+  function validateScheme(scheme) {
+    const stringScheme = String(scheme);
+    if (!VALID_SCHEME.test(stringScheme)) {
       throw new TypeError(MALFORMED_SCHEME_ERROR);
     }
-    return decodedScheme;
+    return stringScheme;
   }
   function normalize(uri2, options2) {
     if (typeof uri2 === "string") {
@@ -96673,6 +96886,9 @@ function requireFastUri() {
     const resolvedSchemeHandler = getSchemeHandler(options2 && options2.scheme || resolved.scheme);
     const resolvedHost = resolved.host;
     const resolvedHostIsIP = resolvedHost !== void 0 && resolvedHost !== "" && (isIPv4(resolvedHost) || normalizeIPv6(resolvedHost).isIPV6);
+    if (hasForbiddenDomainHost(resolved, options2 || {}, resolvedSchemeHandler, resolvedHostIsIP)) {
+      throw new Error(MALFORMED_HOST_ERROR);
+    }
     canonicalizeHost(resolved, options2 || {}, resolvedSchemeHandler, resolvedHostIsIP);
     const encodedASCIIHost = resolvedHost && resolvedHost.indexOf("%") !== -1 && !new RegExp("\\P{ASCII}", "u").test(resolvedHost);
     if (resolved.error && !encodedASCIIHost) {
@@ -96714,14 +96930,15 @@ function requireFastUri() {
           if (relative.path[0] === "/") {
             target2.path = removeDotSegments(relative.path);
           } else {
-            if ((base.userinfo !== void 0 || base.host !== void 0 || base.port !== void 0) && !base.path) {
+            const baseHasAuthority = base.userinfo !== void 0 || base.host !== void 0 || base.port !== void 0;
+            if (baseHasAuthority && !base.path) {
               target2.path = "/" + relative.path;
             } else if (!base.path) {
               target2.path = relative.path;
             } else {
               target2.path = base.path.slice(0, base.path.lastIndexOf("/") + 1) + relative.path;
             }
-            target2.path = removeDotSegments(target2.path);
+            target2.path = base.scheme === void 0 && !baseHasAuthority && target2.path[0] !== "/" ? removeDotSegmentsRelative(target2.path) : removeDotSegments(target2.path);
           }
           target2.query = relative.query;
         }
@@ -96759,12 +96976,13 @@ function requireFastUri() {
     const options2 = Object.assign({}, opts);
     const uriTokens = [];
     if (component.scheme) {
-      component.scheme = decodeValidScheme(component.scheme);
+      component.scheme = validateScheme(component.scheme);
     }
     const schemeHandler = getSchemeHandler(options2.scheme || component.scheme);
     if (schemeHandler && schemeHandler.serialize) schemeHandler.serialize(component, options2);
     const hasAuthority = component.userinfo !== void 0 || component.host !== void 0 || component.port !== void 0;
-    const pathNoScheme = !options2.skipEscape && component.scheme === void 0 && !hasAuthority;
+    const schemelessReference = (component.scheme === void 0 || options2.reference === "suffix") && !hasAuthority;
+    const pathNoScheme = !options2.skipEscape && schemelessReference;
     if (component.path !== void 0) {
       if (!options2.skipEscape) {
         component.path = serializePathEncoding(component.path, pathNoScheme);
@@ -96773,7 +96991,7 @@ function requireFastUri() {
       }
     }
     if (options2.reference !== "suffix" && component.scheme) {
-      component.scheme = decodeValidScheme(component.scheme);
+      component.scheme = validateScheme(component.scheme);
       uriTokens.push(component.scheme, ":");
     }
     const authority = recomposeAuthority(component);
@@ -96789,9 +97007,9 @@ function requireFastUri() {
     if (component.path !== void 0) {
       let s = component.path;
       if (!options2.absolutePath && (!schemeHandler || !schemeHandler.absolutePath)) {
-        s = removeDotSegments(s);
+        s = schemelessReference && s[0] !== "/" ? removeDotSegmentsRelative(s) : removeDotSegments(s);
       }
-      if (pathNoScheme) {
+      if (schemelessReference) {
         s = serializePathEncoding(s, true);
       }
       if (authority === void 0 && s[0] === "/" && s[1] === "/") {
@@ -96838,15 +97056,33 @@ function requireFastUri() {
     return hasMalformedPercentEncoding(matches[3]) || host2 !== void 0 && !isIPLiteral(host2) && hasMalformedPercentEncoding(host2) || hasMalformedPercentEncoding(matches[6]) || hasMalformedPercentEncoding(matches[7]) || hasMalformedPercentEncoding(matches[8]);
   }
   function canonicalizeHost(parsed, options2, schemeHandler, isIP2) {
+    if (hasForbiddenDomainHost(parsed, options2, schemeHandler, isIP2)) {
+      parsed.error = parsed.error || MALFORMED_HOST_ERROR;
+      return true;
+    }
     if (!options2.unicodeSupport && (!schemeHandler || !schemeHandler.unicodeSupport) && parsed.host && !isIPLiteral(parsed.host) && (options2.domainHost || schemeHandler && schemeHandler.domainHost) && isIP2 === false && nonSimpleDomain(parsed.host)) {
+      let url2;
       try {
-        parsed.host = new URL("http://" + parsed.host).hostname;
+        url2 = new URL("http://" + parsed.host);
       } catch (e) {
         parsed.error = parsed.error || "Host's domain name can not be converted to ASCII: " + e;
         return true;
       }
+      if (!isHostOnlyURL(url2)) {
+        parsed.error = parsed.error || MALFORMED_HOST_ERROR;
+        return true;
+      }
+      parsed.host = url2.hostname;
     }
     return false;
+  }
+  function hasForbiddenDomainHost(parsed, options2, schemeHandler, isIP2) {
+    return Boolean(
+      parsed.host && isIP2 === false && !isIPLiteral(parsed.host) && (options2.domainHost || schemeHandler && schemeHandler.domainHost) && FORBIDDEN_DOMAIN_HOST_CHARACTER.test(parsed.host)
+    );
+  }
+  function isHostOnlyURL(url2) {
+    return url2.username === "" && url2.password === "" && url2.port === "" && url2.pathname === "/" && url2.search === "" && url2.hash === "" && url2.hostname !== "";
   }
   function parseWithStatus(uri2, opts) {
     const options2 = Object.assign({}, opts);
@@ -96902,9 +97138,8 @@ function requireFastUri() {
       parsed.query = matches[7];
       parsed.fragment = matches[8];
       if (parsed.scheme !== void 0) {
-        const decodedScheme = unescape(parsed.scheme);
-        if (VALID_SCHEME.test(decodedScheme)) {
-          parsed.scheme = decodedScheme.toLowerCase();
+        if (VALID_SCHEME.test(parsed.scheme)) {
+          parsed.scheme = parsed.scheme.toLowerCase();
         } else {
           parsed.error = parsed.error || MALFORMED_SCHEME_ERROR;
           malformedScheme = true;
@@ -96932,7 +97167,7 @@ function requireFastUri() {
           malformedIPLiteral = hasIPLiteralBracket && (!bracketedIPLiteral || ipv6result.error === true);
           parsed.host = isIP2 ? ipv6result.host : ipv6result.host.toLowerCase();
           if (malformedIPLiteral) {
-            parsed.error = parsed.error || "URI host is malformed.";
+            parsed.error = parsed.error || MALFORMED_HOST_ERROR;
             malformedAuthorityOrPort = true;
           }
         } else {
@@ -96960,7 +97195,7 @@ function requireFastUri() {
         if (!isIP2) {
           host2 = normalizePercentEncoding(host2.toLowerCase());
         }
-        parsed.host = reescapeHostDelimiters(host2, isIP2);
+        parsed.host = isIP2 || options2.scheme !== "null" ? reescapeHostDelimiters(host2, isIP2) : host2;
       }
       if (!schemeHandler || schemeHandler && !schemeHandler.skipNormalize) {
         if (parsed.path) {
@@ -97078,7 +97313,7 @@ function requireCore$3() {
     const util_1 = /* @__PURE__ */ requireUtil$1();
     const $dataRefSchema = require$$9$1;
     const uri_1 = /* @__PURE__ */ requireUri$1();
-    const defaultRegExp = (str, flags) => new RegExp(str, flags);
+    const defaultRegExp = (str2, flags) => new RegExp(str2, flags);
     defaultRegExp.code = "new RegExp";
     const META_IGNORE_OPTIONS = ["removeAdditional", "useDefaults", "coerceTypes"];
     const EXT_SCOPE_NAMES = /* @__PURE__ */ new Set([
@@ -97877,16 +98112,16 @@ function requireUcs2length$1() {
   if (hasRequiredUcs2length$1) return ucs2length$1;
   hasRequiredUcs2length$1 = 1;
   Object.defineProperty(ucs2length$1, "__esModule", { value: true });
-  function ucs2length2(str) {
-    const len = str.length;
+  function ucs2length2(str2) {
+    const len = str2.length;
     let length = 0;
     let pos = 0;
     let value2;
     while (pos < len) {
       length++;
-      value2 = str.charCodeAt(pos++);
+      value2 = str2.charCodeAt(pos++);
       if (value2 >= 55296 && value2 <= 56319 && pos < len) {
-        value2 = str.charCodeAt(pos);
+        value2 = str2.charCodeAt(pos);
         if ((value2 & 64512) === 56320)
           pos++;
       }
@@ -99629,16 +99864,16 @@ function requireFormats() {
     function isLeapYear(year) {
       return year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
     }
-    const DATE = /^(\d\d\d\d)-(\d\d)-(\d\d)$/;
+    const DATE2 = /^(\d\d\d\d)-(\d\d)-(\d\d)$/;
     const DAYS = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    function date2(str) {
-      const matches = DATE.exec(str);
+    function date2(str2) {
+      const matches = DATE2.exec(str2);
       if (!matches)
         return false;
       const year = +matches[1];
       const month = +matches[2];
-      const day = +matches[3];
-      return month >= 1 && month <= 12 && day >= 1 && day <= (month === 2 && isLeapYear(year) ? 29 : DAYS[month]);
+      const day2 = +matches[3];
+      return month >= 1 && month <= 12 && day2 >= 1 && day2 <= (month === 2 && isLeapYear(year) ? 29 : DAYS[month]);
     }
     function compareDate(d1, d2) {
       if (!(d1 && d2))
@@ -99649,10 +99884,10 @@ function requireFormats() {
         return -1;
       return 0;
     }
-    const TIME = /^(\d\d):(\d\d):(\d\d(?:\.\d+)?)(z|([+-])(\d\d)(?::?(\d\d))?)?$/i;
+    const TIME2 = /^(\d\d):(\d\d):(\d\d(?:\.\d+)?)(z|([+-])(\d\d)(?::?(\d\d))?)?$/i;
     function getTime(strictTimeZone) {
-      return function time2(str) {
-        const matches = TIME.exec(str);
+      return function time2(str2) {
+        const matches = TIME2.exec(str2);
         if (!matches)
           return false;
         const hr = +matches[1];
@@ -99683,8 +99918,8 @@ function requireFormats() {
     function compareIsoTime(t1, t2) {
       if (!(t1 && t2))
         return void 0;
-      const a1 = TIME.exec(t1);
-      const a2 = TIME.exec(t2);
+      const a1 = TIME2.exec(t1);
+      const a2 = TIME2.exec(t2);
       if (!(a1 && a2))
         return void 0;
       t1 = a1[1] + a1[2] + a1[3];
@@ -99698,8 +99933,8 @@ function requireFormats() {
     const DATE_TIME_SEPARATOR = /t|\s/i;
     function getDateTime(strictTimeZone) {
       const time2 = getTime(strictTimeZone);
-      return function date_time(str) {
-        const dateTime = str.split(DATE_TIME_SEPARATOR);
+      return function date_time(str2) {
+        const dateTime = str2.split(DATE_TIME_SEPARATOR);
         return dateTime.length === 2 && date2(dateTime[0]) && time2(dateTime[1]);
       };
     }
@@ -99724,13 +99959,13 @@ function requireFormats() {
     }
     const NOT_URI_FRAGMENT = /\/|:/;
     const URI = /^(?:[a-z][a-z0-9+\-.]*:)(?:\/?\/(?:(?:[a-z0-9\-._~!$&'()*+,;=:]|%[0-9a-f]{2})*@)?(?:\[(?:(?:(?:(?:[0-9a-f]{1,4}:){6}|::(?:[0-9a-f]{1,4}:){5}|(?:[0-9a-f]{1,4})?::(?:[0-9a-f]{1,4}:){4}|(?:(?:[0-9a-f]{1,4}:){0,1}[0-9a-f]{1,4})?::(?:[0-9a-f]{1,4}:){3}|(?:(?:[0-9a-f]{1,4}:){0,2}[0-9a-f]{1,4})?::(?:[0-9a-f]{1,4}:){2}|(?:(?:[0-9a-f]{1,4}:){0,3}[0-9a-f]{1,4})?::[0-9a-f]{1,4}:|(?:(?:[0-9a-f]{1,4}:){0,4}[0-9a-f]{1,4})?::)(?:[0-9a-f]{1,4}:[0-9a-f]{1,4}|(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?))|(?:(?:[0-9a-f]{1,4}:){0,5}[0-9a-f]{1,4})?::[0-9a-f]{1,4}|(?:(?:[0-9a-f]{1,4}:){0,6}[0-9a-f]{1,4})?::)|[Vv][0-9a-f]+\.[a-z0-9\-._~!$&'()*+,;=:]+)\]|(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)|(?:[a-z0-9\-._~!$&'()*+,;=]|%[0-9a-f]{2})*)(?::\d*)?(?:\/(?:[a-z0-9\-._~!$&'()*+,;=:@]|%[0-9a-f]{2})*)*|\/(?:(?:[a-z0-9\-._~!$&'()*+,;=:@]|%[0-9a-f]{2})+(?:\/(?:[a-z0-9\-._~!$&'()*+,;=:@]|%[0-9a-f]{2})*)*)?|(?:[a-z0-9\-._~!$&'()*+,;=:@]|%[0-9a-f]{2})+(?:\/(?:[a-z0-9\-._~!$&'()*+,;=:@]|%[0-9a-f]{2})*)*)(?:\?(?:[a-z0-9\-._~!$&'()*+,;=:@/?]|%[0-9a-f]{2})*)?(?:#(?:[a-z0-9\-._~!$&'()*+,;=:@/?]|%[0-9a-f]{2})*)?$/i;
-    function uri2(str) {
-      return NOT_URI_FRAGMENT.test(str) && URI.test(str);
+    function uri2(str2) {
+      return NOT_URI_FRAGMENT.test(str2) && URI.test(str2);
     }
     const BYTE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/gm;
-    function byte(str) {
+    function byte(str2) {
       BYTE.lastIndex = 0;
-      return BYTE.test(str);
+      return BYTE.test(str2);
     }
     const MIN_INT32 = -2147483648;
     const MAX_INT32 = 2 ** 31 - 1;
@@ -99744,11 +99979,11 @@ function requireFormats() {
       return true;
     }
     const Z_ANCHOR = /[^\\]\\Z/;
-    function regex(str) {
-      if (Z_ANCHOR.test(str))
+    function regex(str2) {
+      if (Z_ANCHOR.test(str2))
         return false;
       try {
-        new RegExp(str);
+        new RegExp(str2);
         return true;
       } catch (e) {
         return false;
@@ -99834,7 +100069,7 @@ function requireCode$1() {
     }
     exports._ = _;
     const plus = new _Code("+");
-    function str(strs, ...args) {
+    function str2(strs, ...args) {
       const expr = [safeStringify(strs[0])];
       let i = 0;
       while (i < args.length) {
@@ -99845,7 +100080,7 @@ function requireCode$1() {
       optimize(expr);
       return new _Code(expr);
     }
-    exports.str = str;
+    exports.str = str2;
     function addCodeArg(code2, arg) {
       if (arg instanceof _Code)
         code2.push(...arg._items);
@@ -99888,7 +100123,7 @@ function requireCode$1() {
       return;
     }
     function strConcat(c1, c2) {
-      return c2.emptyStr() ? c1 : c1.emptyStr() ? c2 : str`${c1}${c2}`;
+      return c2.emptyStr() ? c1 : c1.emptyStr() ? c2 : str2`${c1}${c2}`;
     }
     exports.strConcat = strConcat;
     function interpolate(x3) {
@@ -100798,10 +101033,10 @@ function requireUtil() {
   const codegen_1 = /* @__PURE__ */ requireCodegen();
   const code_1 = /* @__PURE__ */ requireCode$1();
   function toHash(arr) {
-    const hash = {};
+    const hash2 = {};
     for (const item of arr)
-      hash[item] = true;
-    return hash;
+      hash2[item] = true;
+    return hash2;
   }
   util.toHash = toHash;
   function alwaysValidSchema(it, schema) {
@@ -100854,22 +101089,22 @@ function requireUtil() {
     return (0, codegen_1._)`${topSchemaRef}${schemaPath}${(0, codegen_1.getProperty)(keyword2)}`;
   }
   util.schemaRefOrVal = schemaRefOrVal;
-  function unescapeFragment(str) {
-    return unescapeJsonPointer(decodeURIComponent(str));
+  function unescapeFragment(str2) {
+    return unescapeJsonPointer(decodeURIComponent(str2));
   }
   util.unescapeFragment = unescapeFragment;
-  function escapeFragment(str) {
-    return encodeURIComponent(escapeJsonPointer(str));
+  function escapeFragment(str2) {
+    return encodeURIComponent(escapeJsonPointer(str2));
   }
   util.escapeFragment = escapeFragment;
-  function escapeJsonPointer(str) {
-    if (typeof str == "number")
-      return `${str}`;
-    return str.replace(/~/g, "~0").replace(/\//g, "~1");
+  function escapeJsonPointer(str2) {
+    if (typeof str2 == "number")
+      return `${str2}`;
+    return str2.replace(/~/g, "~0").replace(/\//g, "~1");
   }
   util.escapeJsonPointer = escapeJsonPointer;
-  function unescapeJsonPointer(str) {
-    return str.replace(/~1/g, "/").replace(/~0/g, "~");
+  function unescapeJsonPointer(str2) {
+    return str2.replace(/~1/g, "/").replace(/~0/g, "~");
   }
   util.unescapeJsonPointer = unescapeJsonPointer;
   function eachItem(xs, f) {
@@ -101860,8 +102095,8 @@ function requireJsonSchemaTraverse() {
       post(schema, jsonPtr, rootSchema, parentJsonPtr, parentKeyword, parentSchema, keyIndex);
     }
   }
-  function escapeJsonPtr(str) {
-    return str.replace(/~/g, "~0").replace(/\//g, "~1");
+  function escapeJsonPtr(str2) {
+    return str2.replace(/~/g, "~0").replace(/\//g, "~1");
   }
   return jsonSchemaTraverse.exports;
 }
@@ -102848,7 +103083,7 @@ function requireCore$1() {
     const util_1 = /* @__PURE__ */ requireUtil();
     const $dataRefSchema = require$$9;
     const uri_1 = /* @__PURE__ */ requireUri();
-    const defaultRegExp = (str, flags) => new RegExp(str, flags);
+    const defaultRegExp = (str2, flags) => new RegExp(str2, flags);
     defaultRegExp.code = "new RegExp";
     const META_IGNORE_OPTIONS = ["removeAdditional", "useDefaults", "coerceTypes"];
     const EXT_SCOPE_NAMES = /* @__PURE__ */ new Set([
@@ -103647,16 +103882,16 @@ function requireUcs2length() {
   if (hasRequiredUcs2length) return ucs2length;
   hasRequiredUcs2length = 1;
   Object.defineProperty(ucs2length, "__esModule", { value: true });
-  function ucs2length$12(str) {
-    const len = str.length;
+  function ucs2length$12(str2) {
+    const len = str2.length;
     let length = 0;
     let pos = 0;
     let value2;
     while (pos < len) {
       length++;
-      value2 = str.charCodeAt(pos++);
+      value2 = str2.charCodeAt(pos++);
       if (value2 >= 55296 && value2 <= 56319 && pos < len) {
-        value2 = str.charCodeAt(pos);
+        value2 = str2.charCodeAt(pos);
         if ((value2 & 64512) === 56320)
           pos++;
       }
@@ -105409,8 +105644,8 @@ function requireDist() {
         return ajv2;
       }
       const [formats2, exportName] = opts.mode === "fast" ? [formats_1.fastFormats, fastName] : [formats_1.fullFormats, fullName];
-      const list = opts.formats || formats_1.formatNames;
-      addFormats(ajv2, list, formats2, exportName);
+      const list2 = opts.formats || formats_1.formatNames;
+      addFormats(ajv2, list2, formats2, exportName);
       if (opts.keywords)
         (0, limit_1.default)(ajv2);
       return ajv2;
@@ -105422,11 +105657,11 @@ function requireDist() {
         throw new Error(`Unknown format "${name2}"`);
       return f;
     };
-    function addFormats(ajv2, list, fs, exportName) {
+    function addFormats(ajv2, list2, fs, exportName) {
       var _a2;
       var _b;
       (_a2 = (_b = ajv2.opts.code).formats) !== null && _a2 !== void 0 ? _a2 : _b.formats = (0, codegen_1._)`require("ajv-formats/dist/formats").${exportName}`;
-      for (const f of list)
+      for (const f of list2)
         ajv2.addFormat(f, fs[f]);
     }
     module.exports = exports = formatsPlugin;
@@ -105801,8 +106036,8 @@ class Server extends Protocol {
    * Override request handler registration to enforce server-side validation for tools/call.
    */
   setRequestHandler(requestSchema, handler) {
-    const shape = getObjectShape(requestSchema);
-    const methodSchema = shape?.method;
+    const shape2 = getObjectShape(requestSchema);
+    const methodSchema = shape2?.method;
     if (!methodSchema) {
       throw new Error("Schema is missing a method literal");
     }
@@ -106230,6 +106465,15 @@ class McpServer {
     this._promptHandlersInitialized = false;
     this.server = new Server(serverInfo, options2);
     this._maxToolInputElements = resolveMaxToolInputElements(options2?.maxToolInputElements);
+    if (options2?.capabilities?.tools) {
+      this.setToolRequestHandlers();
+    }
+    if (options2?.capabilities?.resources) {
+      this.setResourceRequestHandlers();
+    }
+    if (options2?.capabilities?.prompts) {
+      this.setPromptRequestHandlers();
+    }
   }
   /**
    * Access experimental features.
@@ -106972,10 +107216,10 @@ function getZodSchemaObject(schema) {
   return schema;
 }
 function promptArgumentsFromSchema(schema) {
-  const shape = getObjectShape(schema);
-  if (!shape)
+  const shape2 = getObjectShape(schema);
+  if (!shape2)
     return [];
-  return Object.entries(shape).map(([name2, field]) => {
+  return Object.entries(shape2).map(([name2, field]) => {
     const description2 = getSchemaDescription(field);
     const isOptional = isSchemaOptional(field);
     return {
@@ -106986,8 +107230,8 @@ function promptArgumentsFromSchema(schema) {
   });
 }
 function getMethodValue(schema) {
-  const shape = getObjectShape(schema);
-  const methodSchema = shape?.method;
+  const shape2 = getObjectShape(schema);
+  const methodSchema = shape2?.method;
   if (!methodSchema) {
     throw new Error("Schema is missing a method literal");
   }
@@ -107243,8 +107487,8 @@ function createIsSession(creds, nativeFetch2, now = Date.now) {
     const method2 = (init.method ?? "GET").toUpperCase();
     if (method2 !== "GET" || !await isLoginPage(first)) return first;
     cookie = null;
-    const retry = await send(input, init, await login());
-    if (await isLoginPage(retry)) {
+    const retry2 = await send(input, init, await login());
+    if (await isLoginPage(retry2)) {
       cookie = null;
       const err = new IsLoginError(
         "unexpected",
@@ -107253,7 +107497,7 @@ function createIsSession(creds, nativeFetch2, now = Date.now) {
       recordFailure(err);
       throw err;
     }
-    return retry;
+    return retry2;
   };
   return { fetch: sessionFetch2 };
 }
@@ -107590,7 +107834,8 @@ const SubjectInfoSchema$1 = object({
   fetchedAt: string(),
   hasPrubezne: boolean().optional(),
   hasTest: boolean().optional(),
-  autoHref: string().nullable().optional()
+  autoHref: string().nullable().optional(),
+  periodId: string().optional()
 }).passthrough();
 const SubjectsDataSchema$1 = object({
   version: number(),
@@ -107713,6 +107958,7 @@ const SubjectGroupSchema = object({
   name: string(),
   statusDescription: string(),
   subjects: array(SubjectStatusSchema),
+  label: string().optional(),
   minCount: number().optional(),
   minCredits: number().optional()
 }).passthrough();
@@ -107821,6 +108067,7 @@ const CourseMetadataSchema$1 = object({
   courseNameEn: string().nullable().optional(),
   courseCode: string().nullable().optional(),
   credits: string().nullable().optional(),
+  completion: string().nullable().optional(),
   garant: object({ name: string().nullable(), id: string().nullable().optional() }).passthrough().nullable().optional(),
   teachers: array(
     object({ name: string(), id: string().nullable().optional(), roles: string() }).passthrough()
@@ -107897,7 +108144,15 @@ const CalendarCustomEventSchema = object({
   date: string(),
   startTime: string(),
   endTime: string(),
-  room: string().optional()
+  room: string().optional(),
+  // A library study-room booking (phone and iPad): its room and the keys that
+  // cancel it. Missing here, zod dropped it on every save and load, and a
+  // booking came back as a plain own event nobody could cancel (2026-11-16).
+  libraryBooking: object({
+    featureId: number(),
+    selfServiceIds: array(string()),
+    unconfirmed: boolean().optional()
+  }).optional()
 });
 const HiddenItemsSchema = object({
   courses: array(
@@ -108005,6 +108260,9 @@ const __vite_import_meta_env__ = {};
 const DB_NAME = __vite_import_meta_env__?.VITE_USE_MOCK_DATA === "true" ? "reis_db_mock" : "reis_db";
 const DB_VERSION = 23;
 const INSTALL_ID_KEY = "install_id";
+const STORE_REVIEW_KEY = "store_review";
+const CRITICAL_POPUP_KEY = "critical_update_popup";
+const PER_INSTALL_META_KEYS = [INSTALL_ID_KEY, STORE_REVIEW_KEY, CRITICAL_POPUP_KEY];
 function isConnectionClosing(e) {
   if (e instanceof DOMException && e.name === "InvalidStateError") return true;
   const msg = e instanceof Error ? e.message : String(e);
@@ -108043,15 +108301,15 @@ class IndexedDBServiceImpl {
             "map_rooms",
             "map_models"
           ];
-          requiredStores.forEach((store) => {
-            if (!db.objectStoreNames.contains(store)) {
-              db.createObjectStore(store);
+          requiredStores.forEach((store2) => {
+            if (!db.objectStoreNames.contains(store2)) {
+              db.createObjectStore(store2);
             }
           });
           const droppedStores = ["iskam"];
-          droppedStores.forEach((store) => {
-            if (db.objectStoreNames.contains(store)) {
-              db.deleteObjectStore(store);
+          droppedStores.forEach((store2) => {
+            if (db.objectStoreNames.contains(store2)) {
+              db.deleteObjectStore(store2);
             }
           });
         },
@@ -108108,9 +108366,9 @@ class IndexedDBServiceImpl {
     if (validated.length === 0) return;
     await this.run(async (db) => {
       const tx = db.transaction(storeName, "readwrite");
-      const store = tx.store;
+      const store2 = tx.store;
       for (const [key, value2] of validated) {
-        store.put(value2, key);
+        store2.put(value2, key);
       }
       await tx.done;
     });
@@ -108124,6 +108382,34 @@ class IndexedDBServiceImpl {
     const validated = writes.map((w2) => ({ ...w2, value: this.validate(w2.store, w2.value) })).filter((w2) => w2.value !== void 0);
     if (validated.length === 0) return;
     await this.run((db) => putAcross(db, validated));
+  }
+  /**
+   * Puts and deletes in one store, in ONE readwrite transaction: all of it
+   * lands or none of it does. Unlike setMany, an invalid value is not skipped:
+   * the deletes beside it may only be right because it lands, so the whole
+   * batch is refused.
+   */
+  async replaceMany(storeName, puts, deletes) {
+    const validated = puts.map(([key, value2]) => {
+      const v = this.validate(storeName, value2);
+      if (v === void 0) throw new Error(`replaceMany: invalid ${String(storeName)} '${key}'`);
+      return [key, v];
+    });
+    if (validated.length === 0 && deletes.length === 0) return;
+    await this.run(async (db) => {
+      const tx = db.transaction(storeName, "readwrite");
+      const ops = [];
+      try {
+        for (const [key, value2] of validated) ops.push(tx.store.put(value2, key));
+        for (const key of deletes) ops.push(tx.store.delete(key));
+      } catch (err) {
+        for (const p of [...ops, tx.done]) p.catch(() => {
+        });
+        tx.abort();
+        throw err;
+      }
+      await Promise.all([...ops, tx.done]);
+    });
   }
   async delete(storeName, key) {
     await this.run((db) => db.delete(storeName, key));
@@ -108153,12 +108439,13 @@ class IndexedDBServiceImpl {
       if (stores.length === 0) return;
       const tx = db.transaction(stores, "readwrite");
       const meta = stores.includes("meta") ? tx.objectStore("meta") : null;
-      const installId = meta ? await meta.get(INSTALL_ID_KEY) : void 0;
-      for (const store of stores) {
-        tx.objectStore(store).clear();
+      const kept = meta ? await Promise.all(PER_INSTALL_META_KEYS.map(async (k) => [k, await meta.get(k)])) : [];
+      for (const store2 of stores) {
+        tx.objectStore(store2).clear();
       }
-      if (meta && typeof installId === "string" && installId.length > 0) {
-        meta.put(installId, INSTALL_ID_KEY);
+      for (const [key, value2] of kept) {
+        if (key === INSTALL_ID_KEY && !(typeof value2 === "string" && value2.length > 0)) continue;
+        if (value2 !== void 0) meta?.put(value2, key);
       }
       await tx.done;
     });
@@ -108417,6 +108704,43 @@ function initProxyListener() {
     } else if (type2 === "REIS_POPUP_STATE") {
       window.dispatchEvent(new CustomEvent("reis:popup-state", { detail: { open: e.data.open } }));
     }
+  });
+}
+function boxDeadline(box) {
+  const m = box.deadline.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})(?: (\d{1,2}):(\d{2}))?/);
+  if (!m) return null;
+  const [, d, mo, y3, h, mi] = m;
+  return new Date(Number(y3), Number(mo) - 1, Number(d), Number(h ?? 0), Number(mi ?? 0));
+}
+function isBoxOpen(box, now) {
+  if (box.isOpen === false) return false;
+  const deadline = boxDeadline(box);
+  return !deadline || deadline.getTime() > now;
+}
+function boxState(box) {
+  if (box.section === "submitted") return "confirmed";
+  if (box.fileCount === 0) return "empty";
+  return box.section === "open" ? "unconfirmed" : "confirmed";
+}
+const LOCK = "reis-known-state";
+function withKnownStateLock(job) {
+  const locks = typeof navigator === "undefined" ? void 0 : navigator.locks;
+  return locks ? locks.request(LOCK, job) : job();
+}
+const KNOWN_BOXES_META_KEY = "odevzdavarny_known";
+const NEW_BOXES_META_KEY = "odevzdavarny_new";
+let queue$2 = Promise.resolve();
+function enqueue$1(job) {
+  const run = queue$2.then(() => withKnownStateLock(job));
+  queue$2 = run.catch(() => void 0);
+  return run;
+}
+function resetNewBoxes() {
+  return enqueue$1(async () => {
+    await Promise.all([
+      IndexedDBService.delete("meta", KNOWN_BOXES_META_KEY),
+      IndexedDBService.delete("meta", NEW_BOXES_META_KEY)
+    ]);
   });
 }
 const DIAGNOSTIC_CAP = 50;
@@ -108709,7 +109033,9 @@ async function fetchUserBaseIds(studium) {
   const m = h.match(/studium=(\d+);obdobi=(\d+)/), idm = h.match(
     /(?:Identifikační\s+číslo\s+uživatele|User's\s+identification\s+number):\s*<\/td>\s*<td[^>]*>\s*(\d+)/i
   );
-  const nm = h.match(/id="prihlasen"[^>]*>\s*(?:Přihlášena?|Logged\s+in):&nbsp;([^&]+)/i);
+  const nm = h.match(
+    /id="(?:prihlasen|logs?)"[^>]*>\s*(?:<strong>\s*)?(?:Přihlášena?|Logged\s+in):(?:\s*<\/strong>)?&nbsp;([^&<]+)/i
+  ) || h.match(/class="user-info"[^>]*>\s*<a\b[^>]*>([^<]+)<\/a>/i);
   const sanitizedHtml = h.replace(/<div class="sideportlet">[\s\S]*?<\/div>/g, "");
   const isErasmus = /Erasmus\s*\+/i.test(sanitizedHtml) || /exchange\s+programs?/i.test(sanitizedHtml) || /výměnné\s+programy/i.test(sanitizedHtml);
   return m ? {
@@ -108757,9 +109083,82 @@ async function fetchUserStudyDetails(studium) {
 }
 async function fetchUserNetId() {
   const res = await fetchWithAuth(`${BASE_URL}/auth/wifi/certifikat.pl?_m=177`), h = await res.text();
-  const m = h.match(/pro uživatele <b>([^<]+)<\/b>/i) || h.match(/for user <b>([^<]+)<\/b>/i);
+  const m = h.match(/(?:pro uživatele|for user)\s+<b\s*>([^<]+)<\/b>/i);
   return { username: m ? m[1] : "" };
 }
+const ALL_FEATURES = [
+  "campusMap",
+  "erasmus",
+  "canteenMenu",
+  "successRates",
+  "similarSubjects",
+  "internships",
+  "facultySearchScope",
+  "bulletin",
+  "teamsOutlook",
+  "novinky",
+  "reports",
+  "partners",
+  "adminConsole",
+  "impersonation",
+  "eduroam",
+  "welcome",
+  "studyDocuments",
+  "practiceTests",
+  "storeRating",
+  "guides",
+  "usageCounts"
+];
+const VSE_PRIVACY_POLICY_URL = "https://gist.github.com/ElijaahInverted/d9d8e5cc17b7ce3f724831d8189ffe15";
+const everything = Object.fromEntries(ALL_FEATURES.map((f) => [f, true]));
+const generalUis = Object.fromEntries(ALL_FEATURES.map((f) => [f, false]));
+const SCHOOL_PROFILES = {
+  mendelu: {
+    id: "mendelu",
+    host: "is.mendelu.cz",
+    name: "MENDELU",
+    features: everything,
+    emailDomain: "mendelu.cz",
+    listing: null
+  },
+  vse: {
+    id: "vse",
+    host: "insis.vse.cz",
+    name: "VŠE",
+    features: generalUis,
+    // Not confirmed by a VŠE student yet (no VŠE account on the team).
+    emailDomain: null,
+    listing: {
+      // No "neoficiální" in the name (Dominik, 2026-11-17); the description says it.
+      name: "reIS pro VŠE",
+      description: "Přehlednější InSIS: rozvrh, zkoušky, předměty a soubory na jednom místě. Neoficiální studentský projekt, s VŠE nesouvisí.",
+      privacyPolicyDoc: "docs/privacy-policy-vse.md",
+      privacyPolicyUrl: VSE_PRIVACY_POLICY_URL
+    }
+  },
+  czu: {
+    id: "czu",
+    host: "is.czu.cz",
+    name: "ČZU",
+    features: generalUis,
+    emailDomain: null,
+    listing: null
+  }
+};
+const isSchoolId = (value2) => Object.prototype.hasOwnProperty.call(SCHOOL_PROFILES, value2);
+function schoolFor(profile) {
+  return {
+    id: profile.id,
+    host: profile.host,
+    name: profile.name,
+    has: (feature) => profile.features[feature],
+    emailFor: (username) => username && profile.emailDomain ? `${username}@${profile.emailDomain}` : ""
+  };
+}
+const built = "mendelu";
+const currentSchool = schoolFor(
+  SCHOOL_PROFILES[isSchoolId(built) ? built : "mendelu"]
+);
 const listeners = /* @__PURE__ */ new Set();
 function announceIdentityChange(params, change) {
   for (const cb of listeners) {
@@ -108809,6 +109208,25 @@ async function getPreferredStudium(studentId) {
 }
 const NEW_POINTS_META_KEY = "zaznamnik_new_points";
 Promise.resolve();
+const KNOWN_TERMS_META_KEY = "exam_terms_known";
+let queue$1 = Promise.resolve();
+function resetExamTerms() {
+  const run = queue$1.then(
+    () => withKnownStateLock(() => IndexedDBService.delete("meta", KNOWN_TERMS_META_KEY))
+  );
+  queue$1 = run.catch(() => void 0);
+  return run;
+}
+const NEW_TERMS_META_KEY = "exam_terms_new";
+let queue = Promise.resolve();
+function enqueue(job) {
+  const run = queue.then(() => withKnownStateLock(job));
+  queue = run.catch(() => void 0);
+  return run;
+}
+function resetUnseenTerms() {
+  return enqueue(() => IndexedDBService.delete("meta", NEW_TERMS_META_KEY));
+}
 const STUDY_STORES = [
   "subjects",
   "exams",
@@ -108834,6 +109252,9 @@ async function clearStudyData() {
     ...meta.map((m) => m.key).filter((k) => k.startsWith(STUDY_META_PREFIX))
   ];
   await Promise.all(keys.map((k) => IndexedDBService.delete("meta", k)));
+  await resetNewBoxes();
+  await resetExamTerms();
+  await resetUnseenTerms();
 }
 let _cached = null;
 let _inflight = null;
@@ -108854,7 +109275,7 @@ async function getUserParams() {
     try {
       stored = await IndexedDBService.get("meta", STORAGE_KEYS.USER_PARAMS);
       if (complete(stored) && _identityChecked) {
-        _cached = stored;
+        _cached = withSchoolEmail(stored);
         return _cached;
       }
       _lastIdentityAttempt = Date.now();
@@ -108869,7 +109290,7 @@ async function getUserParams() {
         await IndexedDBService.clearAll();
         wiped = true;
       } else if (complete(stored) && !needsStudyResolution(stored, studies, preferred)) {
-        _cached = stored;
+        _cached = withSchoolEmail(stored);
         return _cached;
       }
       const choice = await chooseStudy({ ...base, studies }, switched ? void 0 : stored, preferred) ?? (complete(stored) ? null : { base, studies: void 0 });
@@ -108881,7 +109302,7 @@ async function getUserParams() {
         ...chosen,
         ...study2,
         ...net,
-        email: net.username ? `${net.username}@mendelu.cz` : "",
+        email: currentSchool.emailFor(net.username),
         isErasmus: chosen.isErasmus,
         ...choice.studies && choice.studies.length > 1 ? { studies: choice.studies } : {}
       };
@@ -108910,8 +109331,14 @@ async function getUserParams() {
   }
 }
 function serveStored(stored) {
-  if (complete(stored)) _cached = stored;
-  return stored ?? null;
+  const served = stored && withSchoolEmail(stored);
+  if (complete(served)) _cached = served;
+  return served ?? null;
+}
+function withSchoolEmail(p) {
+  if (!p.username) return p;
+  const email2 = currentSchool.emailFor(p.username);
+  return p.email === email2 ? p : { ...p, email: email2 };
 }
 const ID_URL = `${BASE_URL}/auth/student/studium.pl`;
 async function fetchUserId() {
@@ -108950,10 +109377,10 @@ async function getUserId() {
   return null;
 }
 function formatDate(date2) {
-  const day = String(date2.getDate()).padStart(2, "0");
+  const day2 = String(date2.getDate()).padStart(2, "0");
   const month = String(date2.getMonth() + 1).padStart(2, "0");
   const year = date2.getFullYear();
-  return `${day}.${month}.${year}`;
+  return `${day2}.${month}.${year}`;
 }
 function getScheduleFormat(date2) {
   return formatDate(date2);
@@ -109081,10 +109508,13 @@ const ExamCapacitySchema = string().transform((val) => {
   const [occupied, total] = clean2.split("/").map((s) => Number(s.replace(/\(\d+\)$/, "")));
   const occupiedNum = occupied ?? NaN;
   const totalNum = total ?? NaN;
+  const reserve = Number(clean2.match(/\((\d+)\)$/)?.[1] ?? 0);
   return {
     occupied: isNaN(occupiedNum) ? 0 : occupiedNum,
     total: isNaN(totalNum) ? 0 : totalNum,
-    raw: clean2
+    raw: clean2,
+    // Only when there is one, so a term without a reserve keeps its old shape.
+    ...reserve > 0 ? { reserve } : {}
   };
 });
 const ExamTermSchema = object({
@@ -109111,6 +109541,10 @@ const ExamTermSchema = object({
   detailUrl: string().optional(),
   durationMinutes: number().nullable().optional(),
   cannotRegister: boolean().optional()
+}).transform((term) => {
+  const c = term.capacity;
+  const taken = !!c && c.total > 0 && c.occupied + (c.reserve ?? 0) >= c.total;
+  return taken && !term.full ? { ...term, full: true } : term;
 });
 const ExamSectionSchema = object({
   id: string(),
@@ -109151,8 +109585,8 @@ function validateHtmlStructure(doc) {
   if (table2) {
     const headers2 = Array.from(table2.querySelectorAll("thead th")).map((h) => h.textContent?.trim() || "");
     const missing = ["Datum/Date/Kdy", "Místnost/Where/Kde", "Zkouška/Type/Druh"].filter((eh) => {
-      const parts = eh.split("/");
-      return !headers2.some((ht) => parts.some((p) => ht.toLowerCase().includes(p.toLowerCase())));
+      const parts2 = eh.split("/");
+      return !headers2.some((ht) => parts2.some((p) => ht.toLowerCase().includes(p.toLowerCase())));
     });
     if (missing.length > 0) {
       warnings.push(`Missing expected headers: ${missing.join(", ")}`);
@@ -109164,19 +109598,19 @@ function normalizeDateString(dateStr, isEn) {
   if (!dateStr || dateStr === "--") return dateStr;
   const mainPart = dateStr.split(" ")[0];
   const timePart = dateStr.split(" ")[1] || "";
-  let day = "";
+  let day2 = "";
   let month = "";
   let year = "";
   if (isEn && mainPart.includes("/")) {
-    [month, day, year] = mainPart.split("/");
+    [month, day2, year] = mainPart.split("/");
   } else if (mainPart.includes(".")) {
-    [day, month, year] = mainPart.split(".");
+    [day2, month, year] = mainPart.split(".");
   } else {
     return dateStr;
   }
-  day = day.padStart(2, "0");
+  day2 = day2.padStart(2, "0");
   month = month.padStart(2, "0");
-  const normalizedDate = `${day}.${month}.${year}`;
+  const normalizedDate = `${day2}.${month}.${year}`;
   return timePart ? `${normalizedDate} ${timePart}` : normalizedDate;
 }
 const ATTEMPT_BY_SYSID = {
@@ -109238,12 +109672,12 @@ function parseRegisteredTerms(doc, getOrCreateSubject, getOrCreateSection, lang2
     const termId = row.querySelector('a[href*="odhlasit_ihned=1"]')?.getAttribute("href")?.match(/termin=(\d+)/)?.[1] || row.querySelector('a[href*="terminy_info"]')?.getAttribute("href")?.match(/termin=(\d+)/)?.[1] || "";
     let registrationStart, registrationEnd, deregistrationDeadline;
     for (let i = 0; i < cols.length; i++) {
-      const parts = linesOf(cols[i]);
-      if (parts.length >= 3) {
+      const parts2 = linesOf(cols[i]);
+      if (parts2.length >= 3) {
         const at = (raw) => raw && raw !== "--" && raw.match(/\d{2}[./]\d{2}[./]\d{4}/) ? normalizeDateString(raw, isEn) : void 0;
-        registrationStart = at(parts[0]);
-        registrationEnd = at(parts[1]);
-        deregistrationDeadline = at(parts[2]);
+        registrationStart = at(parts2[0]);
+        registrationEnd = at(parts2[1]);
+        deregistrationDeadline = at(parts2[2]);
         if (deregistrationDeadline || registrationEnd) break;
       }
     }
@@ -109364,14 +109798,14 @@ function parseAvailableTerms(doc, getOrCreateSubject, getOrCreateSection, lang2 
     }
     let registrationStart, registrationEnd, deregistrationDeadline;
     for (let i = 0; i < cols.length; i++) {
-      const parts = cols[i].innerHTML.split(/<br\s*\/?>/i).map((p) => p.replace(/<[^>]*>/g, "").trim());
-      if (parts.length >= 3) {
-        if (parts[0] !== "--" && parts[0].match(/\d{2}[./]\d{2}[./]\d{4}/))
-          registrationStart = normalizeDateString(parts[0], isEn);
-        if (parts[1] !== "--" && parts[1].match(/\d{2}[./]\d{2}[./]\d{4}/))
-          registrationEnd = normalizeDateString(parts[1], isEn);
-        if (parts[2] !== "--" && parts[2].match(/\d{2}[./]\d{2}[./]\d{4}/))
-          deregistrationDeadline = normalizeDateString(parts[2], isEn);
+      const parts2 = cols[i].innerHTML.split(/<br\s*\/?>/i).map((p) => p.replace(/<[^>]*>/g, "").trim());
+      if (parts2.length >= 3) {
+        if (parts2[0] !== "--" && parts2[0].match(/\d{2}[./]\d{2}[./]\d{4}/))
+          registrationStart = normalizeDateString(parts2[0], isEn);
+        if (parts2[1] !== "--" && parts2[1].match(/\d{2}[./]\d{2}[./]\d{4}/))
+          registrationEnd = normalizeDateString(parts2[1], isEn);
+        if (parts2[2] !== "--" && parts2[2].match(/\d{2}[./]\d{2}[./]\d{4}/))
+          deregistrationDeadline = normalizeDateString(parts2[2], isEn);
         break;
       }
     }
@@ -109510,6 +109944,40 @@ function mergeDualLanguageExams(czData, enData) {
   });
   return merged;
 }
+function classifyIsPage(value2, parsed, shape2) {
+  if (parsed > 0) return { kind: "data", value: value2 };
+  if (shape2.rows > 0 || shape2.loginForm) return { kind: "unrecognised", shape: shape2 };
+  return { kind: "empty" };
+}
+function isLoginForm(html) {
+  return /name="credential_1"/.test(html);
+}
+function notUnderstood(resource, shape2) {
+  const counts = Object.entries(shape2).map(([k, v]) => `${k}=${String(v)}`).join(" ");
+  return new Error(`${resource} page not understood: ${counts}`);
+}
+const REGISTERED_MIN_CELLS = 6;
+const AVAILABLE_MIN_CELLS = 8;
+function examsPageShape(html) {
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  const offered = (selector, minCells) => Array.from(doc.querySelectorAll(`${selector} tbody tr`)).filter(
+    (row) => row.querySelectorAll("td").length >= minCells
+  ).length;
+  const registered = offered("#table_1", REGISTERED_MIN_CELLS);
+  const available = offered(AVAILABLE_TABLE.selector, AVAILABLE_MIN_CELLS);
+  const blocked = offered(BLOCKED_TABLE.selector, AVAILABLE_MIN_CELLS);
+  return {
+    rows: registered + available + blocked,
+    registered,
+    available,
+    blocked,
+    tables: ["#table_1", AVAILABLE_TABLE.selector, BLOCKED_TABLE.selector].filter(
+      (s) => doc.querySelector(s)
+    ).length,
+    signedIn: html.includes("logout.pl"),
+    loginForm: isLoginForm(html)
+  };
+}
 async function getExamListUrl(lang2 = "cz") {
   const isLang = lang2;
   const params = await getUserParams();
@@ -109522,7 +109990,12 @@ async function fetchExamDataOrThrow(lang2) {
   const url2 = await getExamListUrl(lang2);
   const response = await fetchWithAuth(url2);
   const html = await response.text();
-  return parseExamData(html, lang2);
+  const exams = parseExamData(html, lang2);
+  if (exams.length > 0) return exams;
+  const shape2 = examsPageShape(html);
+  if (classifyIsPage(exams, 0, shape2).kind === "unrecognised")
+    throw notUnderstood(`exams (${lang2})`, shape2);
+  return exams;
 }
 async function fetchExamData(lang2 = "cz") {
   try {
@@ -109578,6 +110051,7 @@ const SubjectInfoSchema = object({
   hasPrubezne: boolean().optional(),
   hasTest: boolean().optional(),
   autoHref: string().nullable().optional(),
+  periodId: string().optional(),
   fetchedAt: string().datetime().or(string())
   // Flexible for ISO strings
 });
@@ -109622,10 +110096,10 @@ function parseAttendance(htmlString) {
       const status = SYSID_TO_STATUS[sysid];
       if (!status) continue;
       const title2 = icon.getAttribute("title") || "";
-      const parts = title2.split(", ");
-      if (parts.length < 3) continue;
-      const [datePart = "", timePart = ""] = parts;
-      const roomAndStatus = parts.slice(2).join(", ");
+      const parts2 = title2.split(", ");
+      if (parts2.length < 3) continue;
+      const [datePart = "", timePart = ""] = parts2;
+      const roomAndStatus = parts2.slice(2).join(", ");
       const room = roomAndStatus.split(" - ")[0] ?? "";
       records.push({ date: datePart, time: timePart, room, status });
     }
@@ -109634,6 +110108,22 @@ function parseAttendance(htmlString) {
     }
   }
   return result2;
+}
+function subjectsPageShape(html) {
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  const table = doc.querySelector("#tmtab_1");
+  const rows2 = table ? Array.from(table.querySelectorAll("tr.uis-hl-table")) : [];
+  const count = (sel) => rows2.filter((r2) => r2.querySelector(sel)).length;
+  return {
+    tables: doc.querySelectorAll('table[id^="tmtab_"]').length,
+    table: !!table,
+    rows: rows2.length,
+    syllabusLinks: count('a[href*="/auth/katalog/syllabus.pl"]'),
+    folderLinks: count('a[href*="../dok_server/slozka.pl"]'),
+    // The same signed-in marker the Capacitor transport checks for.
+    signedIn: html.includes("logout.pl"),
+    loginForm: isLoginForm(html)
+  };
 }
 const STUDENT_LIST_URL = `${BASE_URL}/auth/student/list.pl`;
 function buildListUrl(lang2, studium, obdobi) {
@@ -109692,6 +110182,11 @@ async function fetchDualLanguageSubjects(studium, obdobi) {
         merged[code2].nameEn = extractCleanName(fullName);
       }
     }
+    const shape2 = subjectsPageShape(czHtml);
+    if (classifyIsPage(merged, Object.keys(merged).length, shape2).kind === "unrecognised") {
+      logError("Api.fetchDualLanguageSubjects", notUnderstood("subjects", shape2));
+      return null;
+    }
     const subjectsData2 = {
       version: 1,
       lastUpdated: (/* @__PURE__ */ new Date()).toISOString(),
@@ -109699,7 +110194,12 @@ async function fetchDualLanguageSubjects(studium, obdobi) {
     };
     const result2 = SubjectsDataSchema.safeParse(subjectsData2);
     const availablePeriods = parseAvailablePeriods(periodsHtml);
-    return { subjects: result2.success ? result2.data : subjectsData2, attendance, availablePeriods };
+    return {
+      subjects: result2.success ? result2.data : subjectsData2,
+      attendance,
+      availablePeriods,
+      shape: shape2
+    };
   } catch (e) {
     logError("Api.fetchDualLanguageSubjects", e);
     return null;
@@ -109786,14 +110286,67 @@ function parseOptionalInt(text2, field, context2) {
   return n;
 }
 const STUDY_PLAN_SORT_PARAM = "razeni=obdobi";
-function repeatedSemesterTitles(plan) {
+function repeatedSemesterTitles(plan2) {
   const seen = /* @__PURE__ */ new Set();
   const repeated = [];
-  for (const { title: title2 } of plan.blocks) {
+  for (const { title: title2 } of plan2.blocks) {
     if (seen.has(title2) && !repeated.includes(title2)) repeated.push(title2);
     seen.add(title2);
   }
   return repeated;
+}
+const BOLD_STYLE = /font-weight:\s*(bold|[6-9]00)\b/i;
+function boldSpans(root) {
+  return Array.from(root.querySelectorAll("span[style]")).filter(
+    (el) => BOLD_STYLE.test(el.getAttribute("style") || "")
+  );
+}
+function rowHeadingText(row) {
+  const el = row.querySelector("b") ?? boldSpans(row)[0];
+  return el ? (el.textContent || "").trim() : "";
+}
+const SUBJECT_ROW_CLASSES = ["predmety_vse", "predmety", "uis-hl-table"];
+const text$3 = (el) => (el.textContent || "").replace(/\s+/g, " ").trim();
+function labelledGroupHeading(row, groupPrefix) {
+  if (SUBJECT_ROW_CLASSES.some((c) => row.classList.contains(c))) return null;
+  const topLevel = Array.from(row.querySelectorAll("b")).filter(
+    (b) => !b.parentElement?.closest("b")
+  );
+  const [first, ...rest] = topLevel;
+  const heading = rest.find((b) => text$3(b).startsWith(groupPrefix));
+  if (!first || !heading) return null;
+  return { heading: text$3(heading), label: text$3(first) };
+}
+function hasStudiedOnlyView(doc) {
+  return doc.querySelector('[id^="zobraz_vse_"], .zobraz_zapsane') !== null;
+}
+const MIN_VISIBLE_CELLS = 6;
+function studyPlanPageShape(doc, html, noSubjectsMessage, plan2) {
+  const table = doc.getElementById("tmtab_1");
+  const studiedOnly = hasStudiedOnlyView(doc);
+  const rows2 = Array.from((table ?? doc).querySelectorAll("tr")).filter((row) => {
+    const vse = row.classList.contains("predmety_vse");
+    if (studiedOnly && vse) return false;
+    if (!vse && !row.classList.contains("uis-hl-table")) return false;
+    if ((row.textContent || "").includes(noSubjectsMessage)) return false;
+    const visible = Array.from(row.querySelectorAll("td")).filter(
+      (cell) => !cell.classList.contains("UISTMNumberCellHidden")
+    );
+    return visible.length >= MIN_VISIBLE_CELLS;
+  }).length;
+  return {
+    rows: rows2,
+    blocks: plan2.blocks.length,
+    table: !!table,
+    signedIn: html.includes("logout.pl"),
+    loginForm: isLoginForm(html)
+  };
+}
+function studyPlanSubjectCount(plan2) {
+  return plan2.blocks.reduce(
+    (n, block) => n + block.groups.reduce((m, group) => m + group.subjects.length, 0),
+    0
+  );
 }
 const STUDY_PLAN_URL = `${BASE_URL}/auth/studijni/studijni_povinnosti.pl`;
 const LANG = {
@@ -109840,13 +110393,20 @@ async function fetchDualLanguageStudyPlan(studium) {
     ]);
     const [czHtml, enHtml] = await Promise.all([czRes.text(), enRes.text()]);
     const parser2 = new DOMParser();
-    const czPlan = parseStudyPlanDOM(parser2.parseFromString(czHtml, "text/html"), "cz");
-    const enPlan = parseStudyPlanDOM(parser2.parseFromString(enHtml, "text/html"), "en");
-    for (const [lang2, plan] of [
-      ["cz", czPlan],
-      ["en", enPlan]
+    const czDoc = parser2.parseFromString(czHtml, "text/html");
+    const enDoc = parser2.parseFromString(enHtml, "text/html");
+    const czPlan = parseStudyPlanDOM(czDoc, "cz");
+    const enPlan = parseStudyPlanDOM(enDoc, "en");
+    for (const [lang2, plan2, doc, html] of [
+      ["cz", czPlan, czDoc, czHtml],
+      ["en", enPlan, enDoc, enHtml]
     ]) {
-      const repeated = repeatedSemesterTitles(plan);
+      const shape2 = studyPlanPageShape(doc, html, LANG[lang2].noSubjectsMessage, plan2);
+      if (classifyIsPage(plan2, studyPlanSubjectCount(plan2), shape2).kind === "unrecognised") {
+        logError("Api.fetchDualLanguageStudyPlan", notUnderstood(`study plan (${lang2})`, shape2));
+        return null;
+      }
+      const repeated = repeatedSemesterTitles(plan2);
       if (repeated.length > 0) {
         logError("Api.fetchDualLanguageStudyPlan", new Error("Study plan repeats semesters"), {
           lang: lang2,
@@ -109863,6 +110423,10 @@ async function fetchDualLanguageStudyPlan(studium) {
 function extractPlanTitle(doc) {
   const fontEls = doc.querySelectorAll('font[size="+1"]');
   for (const el of fontEls) {
+    const text2 = (el.textContent || "").trim();
+    if (/[A-Z]-\w+.*[ZW]S\s+\d{4}/.test(text2)) return text2;
+  }
+  for (const el of fontEls.length ? [] : boldSpans(doc)) {
     const text2 = (el.textContent || "").trim();
     if (/[A-Z]-\w+.*[ZW]S\s+\d{4}/.test(text2)) return text2;
   }
@@ -109913,12 +110477,12 @@ function parseStudyPlanDOM(doc, lang2) {
   let currentGroup = null;
   const table = doc.getElementById("tmtab_1") || doc;
   const rows2 = Array.from(table.querySelectorAll("tr"));
+  const studiedOnly = hasStudiedOnlyView(doc);
   for (let i = 0; i < rows2.length; i++) {
     const row = rows2[i];
     const cells2 = Array.from(row.querySelectorAll("td"));
     if (cells2.length === 2 && (row.textContent || "").trim() === "") continue;
-    const boldEls = row.querySelectorAll("b");
-    const boldText = boldEls.length > 0 ? (boldEls[0].textContent || "").trim() : "";
+    const boldText = rowHeadingText(row);
     if (boldText.match(L.semesterPattern) || L.wholeplanGroups.includes(boldText)) {
       const isPool = L.wholeplanGroups.includes(boldText);
       currentBlock = { title: boldText, groups: [], isWholePlanPool: isPool };
@@ -109926,22 +110490,24 @@ function parseStudyPlanDOM(doc, lang2) {
       currentGroup = null;
       continue;
     }
-    if (boldText.startsWith(L.groupPrefix)) {
-      const rawText = (row.textContent || "").trim();
-      let name2 = boldText;
+    const labelled = boldText.startsWith(L.groupPrefix) ? null : labelledGroupHeading(row, L.groupPrefix);
+    if (boldText.startsWith(L.groupPrefix) || labelled) {
+      const rawText = labelled ? labelled.heading : (row.textContent || "").trim();
+      let name2 = labelled ? labelled.heading : boldText;
       let statusDesc = "";
       if (rawText.includes("-")) {
-        const parts = rawText.split("-");
-        name2 = parts[0].trim();
-        statusDesc = parts.slice(1).join("-").trim();
+        const parts2 = rawText.split("-");
+        name2 = parts2[0].trim();
+        statusDesc = parts2.slice(1).join("-").trim();
       } else {
-        statusDesc = rawText;
+        statusDesc = labelled ? "" : rawText;
       }
       const constraint = parseGroupConstraint(name2);
       currentGroup = {
         name: name2,
         statusDescription: statusDesc,
         subjects: [],
+        ...labelled ? { label: labelled.label } : {},
         ...constraint.minCount !== void 0 ? { minCount: constraint.minCount } : {},
         ...constraint.minCredits !== void 0 ? { minCredits: constraint.minCredits } : {}
       };
@@ -109950,6 +110516,7 @@ function parseStudyPlanDOM(doc, lang2) {
       }
       continue;
     }
+    if (studiedOnly && row.classList.contains("predmety_vse")) continue;
     if (row.classList.contains("predmety_vse") || row.classList.contains("uis-hl-table")) {
       if ((row.textContent || "").includes(L.noSubjectsMessage)) continue;
       const visibleCells = cells2.filter(
@@ -110192,11 +110759,169 @@ function parseZameraniSubjectList(text2) {
   }
   return out;
 }
+const BASE = BASE_URL;
+function parseCzechFloat(text2) {
+  const n = parseFloat(text2.replace(/\s/g, "").replace(",", "."));
+  return Number.isFinite(n) ? n : 0;
+}
+function normalizeText(el) {
+  return (el?.textContent ?? "").replace(/ /g, " ").trim();
+}
+function isSectionHeading(el) {
+  const t = el.tagName;
+  return (t === "BIG" || t === "H2" || t === "H3" || t === "H4") && !!el.querySelector("b, strong");
+}
+function extractArchName(el) {
+  const t = el.tagName;
+  if (t === "B" || t === "STRONG") return normalizeText(el) || null;
+  const bold = Array.from(el.children).find((c) => c.tagName === "B" || c.tagName === "STRONG") ?? null;
+  if (bold) return normalizeText(bold) || null;
+  return null;
+}
+function isEmptyState(el) {
+  const text2 = (el.textContent ?? "").replace(/ /g, " ");
+  if (text2.includes("nemáte dosud")) return true;
+  if (el.tagName === "B" || el.tagName === "STRONG") {
+    const s1 = el.nextSibling;
+    const s2 = s1?.nextSibling;
+    return [s1?.textContent ?? "", s2?.textContent ?? ""].join(" ").replace(/ /g, " ").includes("nemáte dosud");
+  }
+  return false;
+}
+function parseArchTable(table) {
+  const headers2 = Array.from(table.querySelectorAll("thead th, tr.zahlavi th"));
+  const hasSlucka = normalizeText(headers2[0]).toLowerCase() === "slučka";
+  const columns = [];
+  headers2.forEach((th, i) => {
+    if (hasSlucka && i === 0) return;
+    columns.push(normalizeText(th));
+  });
+  const firstRow = table.querySelector("tbody tr");
+  const cells2 = firstRow ? Array.from(firstRow.querySelectorAll("td")) : [];
+  const values2 = [];
+  cells2.forEach((td, i) => {
+    if (hasSlucka && i === 0) return;
+    values2.push(normalizeText(td));
+  });
+  return { columns, values: values2 };
+}
+function parsePhPage(html) {
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  const sections = [];
+  const sectionHeadings = Array.from(doc.querySelectorAll("big b, h2 b, h3 b, h4 b")).map((b) => b.parentElement).filter((el) => isSectionHeading(el));
+  if (sectionHeadings.length === 0) {
+    return { sections: [], fetchedAt: Date.now() };
+  }
+  for (const heading of sectionHeadings) {
+    const label2 = normalizeText(heading);
+    const arches = [];
+    let cur2 = heading.nextElementSibling;
+    while (cur2 && !isSectionHeading(cur2)) {
+      const archName = extractArchName(cur2);
+      if (!archName) {
+        cur2 = cur2.nextElementSibling;
+        continue;
+      }
+      if (isEmptyState(cur2)) {
+        arches.push({ name: archName, empty: true, columns: [], values: [] });
+        cur2 = cur2.nextElementSibling;
+        continue;
+      }
+      let table = null;
+      let next = cur2.nextElementSibling;
+      while (next && !isSectionHeading(next)) {
+        if (next.tagName === "TABLE") {
+          table = next;
+          break;
+        }
+        const inner = next.querySelector("table");
+        if (inner) {
+          table = inner;
+          break;
+        }
+        if (extractArchName(next)) break;
+        next = next.nextElementSibling;
+      }
+      if (table) {
+        const { columns, values: values2 } = parseArchTable(table);
+        arches.push({ name: archName, empty: false, columns, values: values2 });
+      } else {
+        arches.push({ name: archName, empty: true, columns: [], values: [] });
+      }
+      cur2 = cur2.nextElementSibling;
+    }
+    sections.push({ label: label2, arches });
+  }
+  return { sections, fetchedAt: Date.now() };
+}
+function parseVtPage(html) {
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  const allText = doc.body?.textContent ?? "";
+  if (allText.includes("Neexistuje žádný Vámi napsaný test.")) {
+    return { tests: [], fetchedAt: Date.now() };
+  }
+  const allTables = Array.from(doc.querySelectorAll("table"));
+  const table = allTables.find(
+    (t) => (t.querySelector("thead") ?? t.querySelector("tr.zahlavi"))?.textContent?.includes(
+      "Název testu"
+    )
+  );
+  if (!table) {
+    return { tests: [], fetchedAt: Date.now() };
+  }
+  const colMap = {};
+  const headerCells = Array.from(
+    table.querySelectorAll("thead th, tr.zahlavi th, thead td, tr.zahlavi td")
+  );
+  headerCells.forEach((th, i) => {
+    const key = normalizeText(th);
+    if (key && !(key in colMap)) colMap[key] = i;
+  });
+  const tests = [];
+  const bodyRows = Array.from(table.querySelectorAll("tbody tr"));
+  for (const row of bodyRows) {
+    const cells2 = Array.from(row.querySelectorAll("td"));
+    if (cells2.length < 4) continue;
+    if (cells2.some((td) => td.hasAttribute("colspan"))) continue;
+    const get = (col) => normalizeText(cells2[colMap[col]]);
+    const name2 = get("Název testu");
+    if (!name2) continue;
+    const score2 = parseCzechFloat(get("Dosaženo bodů"));
+    const maxScore = parseInt(get("Max. bodů")) || 0;
+    const successPct = parseCzechFloat(get("Úspěšnost").replace(/\s*%$/, ""));
+    const submittedAt = get("Odevzdáno");
+    const teacher = get("Správce");
+    const detailCell = cells2[colMap["Podrobnosti"]];
+    const hasDetail = !!detailCell?.querySelector("a");
+    tests.push({ name: name2, score: score2, maxScore, successPct, submittedAt, teacher, hasDetail });
+  }
+  return { tests, fetchedAt: Date.now() };
+}
+async function fetchSubjectZaznamnik(studium, obdobi, predmetId) {
+  try {
+    const phUrl = `${BASE}/auth/student/list.pl?studium=${studium};obdobi=${obdobi};predmet=${predmetId};prubezne=1;lang=cz`;
+    const vtUrl = `${BASE}/auth/student/list.pl?studium=${studium};obdobi=${obdobi};predmet=${predmetId};test=1;lang=cz`;
+    const [phRes, vtRes] = await Promise.all([fetchWithAuth(phUrl), fetchWithAuth(vtUrl)]);
+    if (!phRes.ok || !vtRes.ok)
+      throw new Error(`HTTP error: PH=${phRes.status} VT=${vtRes.status}`);
+    const [phHtml, vtHtml] = await Promise.all([phRes.text(), vtRes.text()]);
+    const ph = parsePhPage(phHtml);
+    const vt = parseVtPage(vtHtml);
+    return { ph, vt };
+  } catch (e) {
+    logError("Api.fetchSubjectZaznamnik", e);
+    return null;
+  }
+}
 const CourseMetadataSchema = object({
   courseName: string().nullable().optional(),
   courseNameCs: string().nullable().optional(),
   courseNameEn: string().nullable().optional(),
   credits: string().nullable(),
+  // InSIS (VŠE) only: "Forma ukončení" ("zkouška", "zápočet"…). MENDELU keeps the
+  // completion inside its own `credits` value (the bold part of the completion
+  // row, e.g. "Exam" from "<b>Exam</b> (5 credits)") and never sets this key.
+  completion: string().nullable().optional(),
   garant: object({
     name: string().nullable(),
     id: string().nullable().optional()
@@ -110234,8 +110959,18 @@ function findHeaderRow(doc, searchTexts) {
   }
   return null;
 }
+const REQUIREMENTS_LABELS = [
+  "Požadavky na ukončení",
+  "Requirements for completion",
+  "Assessment methods:",
+  "Metody hodnocení:"
+];
+const INSIS_REQUIREMENTS_LABELS = [
+  "Zvláštní podmínky a podrobnosti:",
+  "Special requirements and details:"
+];
 function parseRequirementsText(doc) {
-  const row = findHeaderRow(doc, ["Požadavky na ukončení", "Requirements for completion", "Assessment methods:", "Metody hodnocení:"]);
+  const row = findHeaderRow(doc, REQUIREMENTS_LABELS) ?? findHeaderRow(doc, INSIS_REQUIREMENTS_LABELS);
   const contentRow = row?.nextElementSibling;
   const cell = contentRow?.querySelector("td");
   if (!cell) return "Error: Section not found";
@@ -110243,11 +110978,21 @@ function parseRequirementsText(doc) {
   clone2.querySelectorAll("br").forEach((br) => br.replaceWith("\n"));
   return (clone2.textContent || "").split("\n").map((l) => l.trim().replace(/\s+/g, " ")).filter((l) => l.length > 0).join("\n");
 }
+const TABLE_LABELS = [
+  "Rozložení požadavků na ukončení",
+  "Assessment criteria ratio",
+  "Podíl kritérií na hodnocení"
+];
+const INSIS_TABLE_LABELS = ["Způsoby a kritéria hodnocení:", "Assessment methods and criteria:"];
 function parseRequirementsTable(doc) {
-  const row = findHeaderRow(doc, ["Rozložení požadavků na ukončení", "Assessment criteria ratio", "Podíl kritérií na hodnocení"]);
+  const row = findHeaderRow(doc, TABLE_LABELS) ?? findHeaderRow(doc, INSIS_TABLE_LABELS);
   const table = row?.nextElementSibling?.querySelector("table");
   if (!table) return [];
-  return Array.from(table.querySelectorAll("tr")).map((r2) => Array.from(r2.querySelectorAll("th, td")).map((c) => (c.textContent || "").trim().replace(/\s+/g, " "))).filter((r2) => r2.length > 0);
+  return Array.from(table.querySelectorAll("tr")).map(
+    (r2) => Array.from(r2.querySelectorAll("th, td")).map(
+      (c) => (c.textContent || "").trim().replace(/\s+/g, " ")
+    )
+  ).filter((r2) => r2.length > 0);
 }
 function parseCourseMetadata(doc, lang2 = "cz") {
   const isValidName = (name2) => {
@@ -110270,6 +111015,9 @@ function parseCourseMetadata(doc, lang2 = "cz") {
   const normalizeLabel = (text2) => {
     return (text2 || "").toLowerCase().replace(/\s+/g, " ").trim().replace(/:$/, "");
   };
+  let sawCredits = false;
+  let sawTeachers = false;
+  const insis = { credits: null, completion: null, teachers: [] };
   doc.querySelectorAll("table tbody tr").forEach((r2) => {
     const c = r2.querySelectorAll("td");
     if (c.length < 2) return;
@@ -110284,6 +111032,7 @@ function parseCourseMetadata(doc, lang2 = "cz") {
     if (l === "způsob ukončení" || l === "způsob ukončení a počet kreditů" || l === "completion" || l === "mode of completion and number of credits") {
       const bold = v.querySelector("b")?.textContent?.trim();
       info.credits = bold || v_txt;
+      sawCredits = true;
     }
     const extractId = (url2) => {
       if (!url2) return null;
@@ -110300,7 +111049,7 @@ function parseCourseMetadata(doc, lang2 = "cz") {
     if (l === "typ předmětu" || l === "course type") {
       info.status = v_txt;
     }
-    if (l === "vyučující" || l === "instructors" || l === "teachers") {
+    const readTeachers = (into) => {
       v.querySelectorAll("a").forEach((a) => {
         let roles = "";
         const nextNode = a.nextSibling;
@@ -110308,14 +111057,26 @@ function parseCourseMetadata(doc, lang2 = "cz") {
           const match = nextNode.textContent?.match(/\(([^)]+)\)/);
           if (match) roles = match[1];
         }
-        info.teachers.push({
+        into.push({
           name: a.textContent?.trim() || "",
           id: extractId(a.getAttribute("href")),
           roles: roles.trim()
         });
       });
+    };
+    if (l === "vyučující" || l === "instructors" || l === "teachers") {
+      sawTeachers = true;
+      readTeachers(info.teachers);
     }
+    if (l === "počet přidělených ects kreditů" || l === "number of ects credits allocated") {
+      insis.credits = v.querySelector("b")?.textContent?.trim() || v_txt;
+    }
+    if (l === "forma ukončení" || l === "mode of completion") insis.completion = v_txt;
+    if (l === "name of lecturer(s)") readTeachers(insis.teachers);
   });
+  if (!sawCredits && insis.credits) info.credits = insis.credits;
+  if (insis.completion) info.completion = insis.completion;
+  if (!sawTeachers && insis.teachers.length > 0) info.teachers = insis.teachers;
   info.courseName = (lang2 === "en" ? info.courseNameEn : info.courseNameCs) || info.courseNameCs || info.courseNameEn;
   return info;
 }
@@ -110323,10 +111084,13 @@ const OBJECTIVES_LABELS = [
   "Cíl předmětu a studijní výstupy",
   "Aims of the course and learning outcomes",
   "Course objectives and learning outcomes",
-  "Aims of the course"
+  "Aims of the course",
+  // What is.mendelu.cz's English page actually prints (singular), read 2026-11-16.
+  "Aim of the course and learning outcomes"
 ];
+const INSIS_OBJECTIVES_LABELS = ["Zaměření předmětu:"];
 function parseCourseObjectives(doc) {
-  const row = findHeaderRow(doc, OBJECTIVES_LABELS);
+  const row = findHeaderRow(doc, OBJECTIVES_LABELS) ?? findHeaderRow(doc, INSIS_OBJECTIVES_LABELS);
   const contentRow = row?.nextElementSibling;
   const cell = contentRow?.querySelector("td");
   if (!cell) return null;
@@ -110678,11 +111442,79 @@ function instructionsFromOnclick(onclick, boxName) {
   const arg = onclick?.match(CALL)?.[1];
   if (arg === void 0) return void 0;
   let html = unescapeJs(arg);
-  const heading = html.match(/^\s*<b>([\s\S]*?)<\/b>/i);
+  const heading = html.match(/^\s*<b\s*>([\s\S]*?)<\/b>/i);
   if (heading && oneLine(htmlToText(heading[1] ?? "")) === `${oneLine(boxName)}:`) {
     html = html.slice(heading[0].length);
   }
   return htmlToText(html) || void 0;
+}
+const LABELS = {
+  cz: {
+    "Název předmětu": "course",
+    "Název": "name",
+    "Typ": "type",
+    "Vypsáno pro": "announcedFor",
+    "Odkdy": "from",
+    "Dokdy": "deadline",
+    "Téma": "topic",
+    "Otevřená": "status",
+    "Body": "points",
+    "Podrobnosti": "details",
+    "Počet souborů": "files",
+    "Pokyny": "instructions",
+    "Vypsal": "teacher",
+    "Vkládat soubory": "insert",
+    "Zobrazit soubory": "display"
+  },
+  en: {
+    "Course title": "course",
+    "Name": "name",
+    "Type": "type",
+    "Announced for": "announcedFor",
+    "Since": "from",
+    "Until": "deadline",
+    "Topic": "topic",
+    "Open": "status",
+    "Points": "points",
+    "Details": "details",
+    "Number of files": "files",
+    "Instructions": "instructions",
+    "Put up by": "teacher",
+    "Insert files": "insert",
+    "Display files": "display"
+  }
+};
+const COMMON = ["course", "name", "type", "announcedFor", "deadline", "topic", "details", "files", "instructions", "teacher"];
+const REQUIRED = {
+  open: [...COMMON, "insert"],
+  submitted: [...COMMON, "status", "points", "display"],
+  closed: [...COMMON, "status", "display"]
+};
+const COURSE_CODE = /^([A-Z]{2,4}-[A-Z0-9]+|\d[A-Z]{2,3}\d{0,3}|[A-Z]{2}\d{2}) /;
+const clean$1 = (s) => s.replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
+function layoutFromHeaders(headers2, section, lang2) {
+  const at = /* @__PURE__ */ new Map();
+  for (let i = 0; i < headers2.length; i++) {
+    const role = LABELS[lang2][clean$1(headers2[i])];
+    if (!role || at.has(role)) return null;
+    at.set(role, i);
+  }
+  const required2 = REQUIRED[section];
+  if (at.size !== required2.length + (at.has("from") ? 1 : 0)) return null;
+  if (!required2.every((r2) => at.has(r2))) return null;
+  if (at.get("course") !== 0 || at.get("name") !== 1 || at.get("type") !== 2) return null;
+  const link = at.get(section === "open" ? "insert" : "display");
+  return {
+    cells: headers2.length,
+    deadline: at.get("deadline"),
+    status: at.get("status") ?? null,
+    points: at.get("points") ?? null,
+    details: at.get("details"),
+    files: at.get("files"),
+    link,
+    instructions: at.get("instructions"),
+    courseCode: COURSE_CODE
+  };
 }
 const LAYOUTS = {
   open: { cells: 11, deadline: 4, status: null, points: null, details: 6, files: 7, link: 10, instructions: 8 },
@@ -110702,7 +111534,7 @@ const MARKERS = {
   }
 };
 const SECTIONS = ["open", "submitted", "closed"];
-const text = (el) => (el?.textContent ?? "").replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
+const text$2 = (el) => (el?.textContent ?? "").replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
 const follows = (a, b) => (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
 function tableBetween(doc, start2, stop) {
   const tables = doc.getElementsByTagName("table");
@@ -110718,28 +111550,27 @@ function absolute(href2) {
   if (href2.startsWith("/")) return `https://is.mendelu.cz${href2}`;
   return `https://is.mendelu.cz/auth/student/${href2}`;
 }
-function parseRow(cols, section) {
-  const L = LAYOUTS[section];
+function parseRow(cols, section, L = LAYOUTS[section]) {
   const courseLink = cols[0].getElementsByTagName("a")[0];
-  const rawCourse = text(courseLink) || text(cols[0]);
-  const codeMatch = rawCourse.match(/^([A-Z]{2,4}-[A-Z0-9]+) /);
+  const rawCourse = text$2(courseLink) || text$2(cols[0]);
+  const codeMatch = rawCourse.match(L.courseCode ?? /^([A-Z]{2,4}-[A-Z0-9]+) /);
   const courseId = courseLink?.getAttribute("href")?.match(/predmet=(\d+)/)?.[1] ?? "";
   const icon = cols[2].querySelector("[data-sysid], img[sysid]");
   const statusSysid = L.status === null ? "" : cols[L.status].querySelector("[data-sysid]")?.getAttribute("data-sysid") ?? "";
   const linkHref = cols[L.link].getElementsByTagName("a")[0]?.getAttribute("href") ?? "";
   const detailsHref = cols[L.details].getElementsByTagName("a")[0]?.getAttribute("href") ?? "";
   const id2 = (linkHref + " " + detailsHref).match(/odevzdavarna=(\d+)/)?.[1] ?? "";
-  const points2 = L.points === null ? "" : text(cols[L.points]);
+  const points2 = L.points === null ? "" : text$2(cols[L.points]);
   const row = {
     section,
     courseId,
     courseCode: codeMatch?.[1] ?? "",
     courseName: codeMatch ? rawCourse.slice(codeMatch[0].length) : rawCourse,
-    name: text(cols[1]),
+    name: text$2(cols[1]),
     type: icon?.getAttribute("data-sysid") ?? icon?.getAttribute("sysid") ?? "",
-    deadline: text(cols[L.deadline]),
+    deadline: text$2(cols[L.deadline]),
     odevzdavarnaId: id2,
-    fileCount: parseInt(text(cols[L.files]), 10) || 0,
+    fileCount: parseInt(text$2(cols[L.files]), 10) || 0,
     isOpen: section === "open" ? true : section === "closed" ? false : !statusSysid.includes("zavren"),
     uploadUrl: absolute(linkHref)
   };
@@ -110751,7 +111582,7 @@ function parseRow(cols, section) {
 }
 function parseOdevzdavarnyPage(doc, lang2) {
   const bolds = Array.from(doc.getElementsByTagName("b"));
-  const markerEls = SECTIONS.map((s) => bolds.find((b) => text(b).startsWith(MARKERS[lang2][s])) ?? null);
+  const markerEls = SECTIONS.map((s) => bolds.find((b) => text$2(b).startsWith(MARKERS[lang2][s])) ?? null);
   if (markerEls.every((m) => m === null)) return null;
   const rows2 = [];
   for (let s = 0; s < SECTIONS.length; s++) {
@@ -110762,12 +111593,13 @@ function parseOdevzdavarnyPage(doc, lang2) {
     const table = tableBetween(doc, marker, stop);
     if (!table) continue;
     const trs = table.getElementsByTagName("tr");
-    const headerCells = trs[0]?.getElementsByTagName("th").length ?? 0;
-    if (headerCells !== LAYOUTS[section].cells) return null;
+    const ths = Array.from(trs[0]?.getElementsByTagName("th") ?? []);
+    const layout = ths.length === LAYOUTS[section].cells ? LAYOUTS[section] : layoutFromHeaders(ths.map(text$2), section, lang2);
+    if (!layout) return null;
     for (let i = 1; i < trs.length; i++) {
       const cols = trs[i].getElementsByTagName("td");
-      if (cols.length !== LAYOUTS[section].cells) continue;
-      const row = parseRow(cols, section);
+      if (cols.length !== layout.cells) continue;
+      const row = parseRow(cols, section, layout);
       if (row.courseName && row.name) rows2.push(row);
     }
   }
@@ -110839,11 +111671,6 @@ async function fetchOdevzdavarny(studium, obdobi) {
     merged.push(box);
   }
   return { assignments: merged, lastFetched: Date.now(), periods: czPage.periods };
-}
-function boxState(box) {
-  if (box.section === "submitted") return "confirmed";
-  if (box.fileCount === 0) return "empty";
-  return box.section === "open" ? "unconfirmed" : "confirmed";
 }
 class RequestQueue {
   queue = [];
@@ -110935,8 +111762,9 @@ function getColumnIndices(table) {
       indices.author = i;
     else if ((text2.includes("datum dokumentu") || text2.includes("document date")) && indices.date === void 0)
       indices.date = i;
-    else if (text2.includes("poslední změna") || text2.includes("last change") || text2.includes("modifikace")) {
+    else if (text2.includes("poslední změna") || text2.includes("last change") || text2.includes("modifikace") || text2.includes("modification")) {
       if (indices.date === void 0) indices.date = i;
+      else if (indices.modified === void 0) indices.modified = i;
     } else if ((text2.includes("komentář") || text2.includes("comment")) && indices.comment === void 0)
       indices.comment = i;
     else if ((text2.includes("ozn.") || text2.includes("subfolder")) && indices.subfolder === void 0)
@@ -110951,6 +111779,44 @@ function iconSysid(scope2) {
   const anyModern = scope2.querySelector("[data-sysid]")?.getAttribute("data-sysid");
   if (anyModern) return anyModern;
   return scope2.querySelector("img[sysid]")?.getAttribute("sysid") || "";
+}
+const ON = /([?;])on=(\d+)/;
+const MAX_PAGE_INDEX = 99;
+function folderPageLinks(doc) {
+  const bar = doc.querySelector("ul.paginator");
+  if (!bar) return null;
+  let current2 = 0;
+  let last = 0;
+  let template;
+  for (const a of Array.from(bar.querySelectorAll("a[href]"))) {
+    if (a.getAttribute("data-active") === "false") continue;
+    const href2 = a.getAttribute("href") ?? "";
+    const on = href2.match(ON)?.[2];
+    if (on === void 0) continue;
+    const n = Number(on);
+    if (a.getAttribute("data-selected") === "true") current2 = n;
+    if (n >= last) {
+      last = n;
+      template = href2;
+    }
+  }
+  if (!template) return { links: [], truncated: false };
+  const links2 = [];
+  for (let n = 0; n <= Math.min(last, MAX_PAGE_INDEX); n++) {
+    if (n !== current2) links2.push(template.replace(ON, `$1on=${n}`));
+  }
+  return { links: links2, truncated: last > MAX_PAGE_INDEX };
+}
+function attachmentFilename(link) {
+  const icon = link.querySelector('[data-sysid^="mime-"]');
+  return sanitizeString(
+    icon?.getAttribute("title") || icon?.getAttribute("aria-label") || "",
+    1e3
+  );
+}
+function typeFromFilename(type2, filename) {
+  if (type2 !== "unknown") return type2;
+  return /\.([a-z0-9]{1,8})$/i.exec(filename)?.[1]?.toLowerCase() ?? type2;
 }
 function parseServerFiles(html) {
   const doc = new DOMParser().parseFromString(html, "text/html");
@@ -111025,6 +111891,9 @@ function parseServerFiles(html) {
         const author = sanitizeString(cells2[authorIdx]?.textContent || "", 200);
         const date2 = sanitizeString(cells2[dateIdx]?.textContent || "", 50);
         const file_comment = sanitizeString(cells2[commentIdx]?.textContent || "", 500);
+        const title2 = sanitizeString(nameCell?.textContent || "", 300);
+        const modifiedIdx = indices.modified;
+        const modified = modifiedIdx === void 0 ? "" : sanitizeString(cells2[modifiedIdx]?.textContent || "", 50);
         const extractedFiles = [];
         Array.from(row.querySelectorAll("a")).forEach((l) => {
           const href2 = l.getAttribute("href");
@@ -111033,7 +111902,7 @@ function parseServerFiles(html) {
             href2.startsWith("http") ? href2 : href2.startsWith("/") ? href2 : `/auth/dok_server/${href2.replace(/^\.\//, "")}`,
             "is.mendelu.cz"
           );
-          const isSystemLabel = /Všechny moje složky|Nadřazená složka|All my folders|Parent folder|Document tree|New documents|DS settings|Searching|Dokumentový strom|Nové dokumenty|Nastavení stromu|Vyhledávání/i.test(
+          const isSystemLabel = /^(?:Všechny moje složky|Nadřazená složka|All my folders|Parent folder|Document tree|New documents|DS settings|Searching|Dokumentový strom|Nové dokumenty|Nastavení stromu|Vyhledávání)(?:\s*\(?\d+\)?)?$/i.test(
             file_name
           );
           const isSystemUrl = /moje_dok\.pl|nove_dok\.pl|nastaveni_stromu\.pl|vyhledavani\.pl|index\.pl|clovek\.pl|dokumenty_ct\.pl/.test(
@@ -111042,17 +111911,33 @@ function parseServerFiles(html) {
           if (!vUrl || isSystemLabel || isSystemUrl) return;
           const sysid = iconSysid(l);
           if (sysid === "mime-prohlizeni-info") return;
-          const type2 = sysid ? sysid.replace("mime-", "") : "unknown";
+          const filename = attachmentFilename(l);
+          const type2 = typeFromFilename(sysid ? sysid.replace("mime-", "") : "unknown", filename);
           if (type2 === "prohlizeni-info") return;
           const existing = extractedFiles.find((f) => f.link === vUrl);
           if (existing) {
             if (existing.type === "unknown" && type2 !== "unknown") existing.type = type2;
+            if (!existing.filename && filename) existing.filename = filename;
             return;
           }
-          extractedFiles.push({ name: file_name, type: type2, link: vUrl });
+          extractedFiles.push({
+            name: file_name,
+            type: type2,
+            link: vUrl,
+            ...filename ? { filename } : {}
+          });
         });
         if (extractedFiles.length > 0) {
-          files2.push({ subfolder, file_name, file_comment, author, date: date2, files: extractedFiles });
+          files2.push({
+            subfolder,
+            file_name,
+            title: title2,
+            file_comment,
+            author,
+            date: date2,
+            ...modified ? { modified } : {},
+            files: extractedFiles
+          });
         }
       } catch (e) {
         if (e instanceof ParserError)
@@ -111061,18 +111946,26 @@ function parseServerFiles(html) {
       }
     });
   });
-  doc.querySelectorAll("a").forEach((a) => {
-    const href2 = a.getAttribute("href");
-    if (href2?.includes("slozka.pl") && !href2.includes("download") && a.textContent?.trim().match(/^\d+[-–]\d+$/)) {
-      if (!paginationLinks.includes(href2)) paginationLinks.push(href2);
-    }
-  });
+  const pageBar = folderPageLinks(doc);
+  if (pageBar) paginationLinks.push(...pageBar.links);
+  else
+    doc.querySelectorAll("a").forEach((a) => {
+      const href2 = a.getAttribute("href");
+      if (href2?.includes("slozka.pl") && !href2.includes("download") && a.textContent?.trim().match(/^\d+[-–]\d+$/)) {
+        if (!paginationLinks.includes(href2)) paginationLinks.push(href2);
+      }
+    });
   const bodyText = doc.body.textContent || "";
   const totalMatch = bodyText.match(/(\d+)\s*[-–]\s*(\d+)\s+(?:z|of)\s+(\d+)/i);
   if (totalMatch) {
     totalRecords = parseInt(totalMatch[3], 10);
   }
-  return { files: files2, paginationLinks, totalRecords };
+  return {
+    files: files2,
+    paginationLinks,
+    paginationTruncated: pageBar?.truncated ?? false,
+    totalRecords
+  };
 }
 function collapseAttachments(files2) {
   const out = [];
@@ -111096,9 +111989,11 @@ function collapseAttachments(files2) {
     }
     const preferred = isDirectDownload(file.link) ? file : kept;
     const other = preferred === file ? kept : file;
+    const filename = preferred.filename ?? other.filename;
     out[existing] = {
       ...preferred,
-      type: preferred.type !== "unknown" ? preferred.type : other.type
+      type: preferred.type !== "unknown" ? preferred.type : other.type,
+      ...filename ? { filename } : {}
     };
   }
   return out;
@@ -111116,9 +112011,6 @@ function stableDocumentKey(files2, fileName) {
   }
   return `${files2[0]?.link ?? ""}_${fileName}`;
 }
-async function fetchFilesFromFolder(folderUrl, lang2 = "cz", recursive2 = true, currentDepth = 0, maxDepth = 2) {
-  return (await fetchFolderListing(folderUrl, lang2, recursive2, currentDepth, maxDepth)).files;
-}
 async function fetchFolderListing(folderUrl, lang2 = "cz", recursive2 = true, currentDepth = 0, maxDepth = 2) {
   let complete2 = true;
   try {
@@ -111128,7 +112020,16 @@ async function fetchFolderListing(folderUrl, lang2 = "cz", recursive2 = true, cu
     }
     const response = await fetchWithAuth(url2);
     const respText = await response.text();
-    const { files: initialFiles, paginationLinks, totalRecords } = parseServerFiles(respText);
+    const {
+      files: initialFiles,
+      paginationLinks,
+      paginationTruncated,
+      totalRecords
+    } = parseServerFiles(respText);
+    if (paginationTruncated) {
+      logError("Documents.paginationTruncated", new Error("folder has more pages than fetched"));
+      complete2 = false;
+    }
     initialFiles.forEach((f) => f.language = lang2);
     const allFiles = [...initialFiles];
     const pageRequests = paginationLinks.map(async (link) => {
@@ -111205,7 +112106,11 @@ async function fetchFolderListing(folderUrl, lang2 = "cz", recursive2 = true, cu
     throw e;
   }
 }
-const DOCUMENT_DESCRIPTION = "Downloads one file from the IS document server and returns the file itself (PDF, DOCX, PPTX, XLSX, ODT, up to 10 MB) for you to read, or the text of a plain-text file. Only accepts a downloadUrl from mendelu_subject_files. Read-only.";
+function documentTitle(doc) {
+  return doc.title || doc.file_name;
+}
+const EXTRACTS_TEXT = false;
+const DOCUMENT_DESCRIPTION = "Downloads one file from the IS document server and returns the file itself (PDF, DOCX, PPTX, XLSX, ODT, up to 10 MB) for you to read, or the text of a plain-text file. Only accepts a downloadUrl from mendelu_subject_files. If the file names a date the student must attend or act on (a test, credit test, defence, deadline, programme day), save each one with mendelu_ledger before you answer, and pass the file `url` and its `modified` date so a later replacement is noticed. Read-only.";
 const MAX_DOCUMENT_BYTES = 10 * 1024 * 1024;
 const MIME_BY_EXT = {
   ".pdf": "application/pdf",
@@ -111227,19 +112132,86 @@ async function documentResult(bytes, meta) {
     }
   };
 }
+class TooBigError extends Error {
+  limit;
+  constructor(limit2) {
+    super(`This file is over ${Math.round(limit2 / 1024 / 1024)} MB, too big to read here.`);
+    this.name = "TooBigError";
+    this.limit = limit2;
+  }
+}
+async function readCapped(res, limit2) {
+  if (Number(res.headers.get("content-length") ?? 0) > limit2) {
+    await res.body?.cancel().catch(() => {
+    });
+    throw new TooBigError(limit2);
+  }
+  const reader = res.body?.getReader();
+  if (!reader) {
+    const whole = new Uint8Array(await res.arrayBuffer());
+    if (whole.byteLength > limit2) throw new TooBigError(limit2);
+    return whole;
+  }
+  const chunks = [];
+  let size2 = 0;
+  for (; ; ) {
+    const { done, value: value2 } = await reader.read();
+    if (done) break;
+    size2 += value2.byteLength;
+    if (size2 > limit2) {
+      await reader.cancel().catch(() => {
+      });
+      throw new TooBigError(limit2);
+    }
+    chunks.push(value2);
+  }
+  const out = new Uint8Array(size2);
+  let at = 0;
+  for (const c of chunks) {
+    out.set(c, at);
+    at += c.byteLength;
+  }
+  return out;
+}
+const carried = /* @__PURE__ */ new WeakMap();
+function carry(answer, original) {
+  if (answer && typeof answer === "object") carried.set(answer, original);
+  return answer;
+}
+function takeOriginal(answer) {
+  if (!answer || typeof answer !== "object") return void 0;
+  const o = carried.get(answer);
+  carried.delete(answer);
+  return o;
+}
 const DOC_EXTENSIONS = [".pdf", ".docx", ".pptx", ".xlsx", ".odt"];
-const TEXT_EXTENSIONS = [".txt", ".md", ".csv"];
+const OLD_OFFICE = [".doc", ".ppt", ".xls"];
+const TEXT_EXTENSIONS = [".txt", ".md", ".csv", ".m", ".ipynb", ".drawio", ".html", ".htm"];
 const clean = (t) => t.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n");
 const extOf = (name2) => /\.[^./\\]+$/.exec(name2 ?? "")?.[0].toLowerCase() ?? "";
 async function listFolderFiles(folderUrl) {
-  const entries2 = await fetchFilesFromFolder(folderUrl);
+  const { files: entries2, complete: complete2 } = await fetchFolderListing(folderUrl);
+  if (!complete2) {
+    throw new Error(
+      "IS sent only part of this folder: a page or subfolder did not load. Try again in a minute."
+    );
+  }
   const seen = /* @__PURE__ */ new Set();
   const out = [];
-  for (const e of entries2 ?? []) {
-    const link = e.files?.find((f) => /download=/.test(f.link))?.link;
-    if (!link || seen.has(link)) continue;
-    seen.add(link);
-    out.push({ name: e.file_name, author: e.author, date: e.date, downloadUrl: link });
+  for (const e of entries2) {
+    for (const f of e.files ?? []) {
+      if (!/download=/.test(f.link) || seen.has(f.link)) continue;
+      seen.add(f.link);
+      out.push({
+        name: documentTitle(e),
+        ...f.filename ? { file: f.filename } : {},
+        ...e.subfolder ? { folder: e.subfolder } : {},
+        author: e.author,
+        date: e.date,
+        ...e.modified ? { modified: e.modified } : {},
+        downloadUrl: f.link
+      });
+    }
   }
   return out;
 }
@@ -111267,66 +112239,48 @@ function assertDokServerUrl(url2) {
     );
   }
 }
+function readKindOf(contentType2, ext) {
+  const type2 = contentType2.toLowerCase();
+  const mediaType = type2.split(";", 1)[0]?.trim() ?? "";
+  if (/pdf|wordprocessingml|presentationml|spreadsheetml|opendocument/.test(type2) || DOC_EXTENSIONS.includes(ext))
+    return "document";
+  if (type2.startsWith("text/") || mediaType === "application/json" || type2.includes("xml") || TEXT_EXTENSIONS.includes(ext))
+    return "text";
+  return null;
+}
+async function textOfBytes(bytes, kind2, meta) {
+  if (kind2 === "document") return documentResult(bytes, meta);
+  const named = meta.filename ? { filename: meta.filename } : {};
+  return { ...named, kind: "text", text: clean(new TextDecoder().decode(bytes)) };
+}
+function headersOf(res) {
+  const type2 = (res.headers.get("content-type") ?? "").toLowerCase();
+  const mediaType = type2.split(";", 1)[0]?.trim() ?? "";
+  const filename = filenameOf(res.headers.get("content-disposition") ?? "");
+  return { type: type2, mediaType, filename, ext: extOf(filename) };
+}
 async function readDokServerFile(url2, fetchImpl) {
   assertDokServerUrl(url2);
   const res = await fetchImpl(url2);
   if (!res.ok) throw new Error(`IS answered HTTP ${res.status} for this file.`);
-  const type2 = (res.headers.get("content-type") ?? "").toLowerCase();
-  const mediaType = type2.split(";", 1)[0]?.trim() ?? "";
-  const filename = filenameOf(res.headers.get("content-disposition") ?? "");
+  const { type: type2, mediaType, filename, ext } = headersOf(res);
   const named = filename ? { filename } : {};
-  const ext = extOf(filename);
-  const isDocument = /pdf|wordprocessingml|presentationml|spreadsheetml|opendocument/.test(type2) || DOC_EXTENSIONS.includes(ext);
-  const isText = type2.startsWith("text/") || mediaType === "application/json" || type2.includes("xml") || TEXT_EXTENSIONS.includes(ext);
-  if (!isDocument && !isText) {
+  const kind2 = readKindOf(type2, ext);
+  if (!kind2) {
     await res.body?.cancel().catch(() => {
     });
     return {
       ...named,
       kind: type2 || "unknown",
       text: "",
-      note: "No text extractor for this file type. Open it in IS directly."
+      note: OLD_OFFICE.includes(ext) ? `This format (${ext}) can't be read as text. Open it in IS directly, or ask the teacher for the ${ext}x version.` : "No text extractor for this file type. Open it in IS directly."
     };
   }
-  const bytes = await readCapped(res, isDocument ? MAX_DOCUMENT_BYTES : MAX_FILE_BYTES);
-  if (isDocument) return documentResult(bytes, { ...named, mediaType, ext });
-  return { ...named, kind: "text", text: clean(new TextDecoder().decode(bytes)) };
+  const bytes = await readCapped(res, kind2 === "document" ? MAX_DOCUMENT_BYTES : MAX_FILE_BYTES);
+  const answer = await textOfBytes(bytes, kind2, { ...named, mediaType, ext });
+  return carry(answer, { bytes, ...named, mediaType });
 }
 const MAX_FILE_BYTES = 30 * 1024 * 1024;
-async function readCapped(res, limit2) {
-  const tooBig = () => new Error(`This file is over ${limit2 / 1024 / 1024} MB, too big to read here.`);
-  if (Number(res.headers.get("content-length") ?? 0) > limit2) {
-    await res.body?.cancel().catch(() => {
-    });
-    throw tooBig();
-  }
-  const reader = res.body?.getReader();
-  if (!reader) {
-    const whole = new Uint8Array(await res.arrayBuffer());
-    if (whole.byteLength > limit2) throw tooBig();
-    return whole;
-  }
-  const chunks = [];
-  let size = 0;
-  for (; ; ) {
-    const { done, value: value2 } = await reader.read();
-    if (done) break;
-    size += value2.byteLength;
-    if (size > limit2) {
-      await reader.cancel().catch(() => {
-      });
-      throw tooBig();
-    }
-    chunks.push(value2);
-  }
-  const out = new Uint8Array(size);
-  let at = 0;
-  for (const c of chunks) {
-    out.set(c, at);
-    at += c.byteLength;
-  }
-  return out;
-}
 function isoDay(d) {
   const p = (n) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
@@ -111369,9 +112323,9 @@ const SUBJECT_FIELDS = [
 ];
 const pick = (o, keys) => Object.fromEntries(keys.filter((k) => k in o).map((k) => [k, o[k]]));
 const asRecords = (v) => Array.isArray(v) ? v.filter((x3) => !!x3 && typeof x3 === "object") : [];
-function compactStudyPlan(plan) {
-  if (!plan || typeof plan !== "object") return plan;
-  const p = plan;
+function compactStudyPlan(plan2) {
+  if (!plan2 || typeof plan2 !== "object") return plan2;
+  const p = plan2;
   return {
     ...p,
     blocks: asRecords(p.blocks).map((block) => ({
@@ -111396,10 +112350,13 @@ function submissionOf(box) {
 }
 const lang = _enum$2(["cz", "en"]).default("cz").describe('Language of names and texts: "cz" (default) or "en".');
 const isoDate = string().regex(/^\d{4}-\d{2}-\d{2}$/, "Use YYYY-MM-DD.");
-async function study() {
+async function study(ctx) {
   const p = await getUserParams();
   if (!p?.studium || !p.obdobi)
-    throw new Error("Could not find an active study on this IS account.");
+    throw new Error(
+      "IS Mendelu did not return your active study. The sign-in may have failed or IS is busy: try again in a minute."
+    );
+  ctx?.noteStudy?.(p);
   return { studium: p.studium, obdobi: p.obdobi };
 }
 function pickLang(value2, l) {
@@ -111411,11 +112368,29 @@ function pickLang(value2, l) {
 function omit(row, keys) {
   return Object.fromEntries(Object.entries(row).filter(([k]) => !keys.includes(k)));
 }
-async function subjectsData() {
-  const { studium, obdobi } = await study();
+async function subjectsData(ctx) {
+  const { studium, obdobi } = await study(ctx);
   const res = await fetchDualLanguageSubjects(studium, obdobi);
   if (!res?.subjects?.data) throw new Error("IS Mendelu did not return your subjects. Try again.");
   return res.subjects.data;
+}
+async function pointsFor(subjectId, ctx) {
+  const { studium, obdobi } = await study(ctx);
+  const z2 = await fetchSubjectZaznamnik(studium, obdobi, subjectId);
+  if (!z2) throw new Error("IS Mendelu did not return your points for this subject. Try again.");
+  return { continuousAssessment: z2.ph.sections, tests: z2.vt.tests };
+}
+async function assignmentsData(ctx, keepIds = false) {
+  const { studium, obdobi } = await study(ctx);
+  const res = await fetchOdevzdavarny(studium, obdobi);
+  if (!res) throw new Error("IS Mendelu did not return your submission boxes. Try again.");
+  return {
+    ...res,
+    assignments: res.assignments.map((r2) => ({
+      ...omit(r2, keepIds ? ["uploadUrl"] : ["uploadUrl", "odevzdavarnaId"]),
+      ...submissionOf(r2)
+    }))
+  };
 }
 const TOOLS = [
   {
@@ -111449,7 +112424,7 @@ const TOOLS = [
     title: "My subjects",
     description: "The subjects you are enrolled in this semester: code, Czech and English name, IS subject id (use it for mendelu_syllabus), and whether it has ongoing assessment. Read-only.",
     input: {},
-    run: async () => Object.values(await subjectsData()).map(
+    run: async (_a2, ctx) => Object.values(await subjectsData(ctx)).map(
       (s) => omit(s, ["folderUrl", "autoHref", "fetchedAt"])
     )
   },
@@ -111458,7 +112433,11 @@ const TOOLS = [
     title: "My study plan",
     description: "Your study plan: required subject groups per semester, credits earned and required, and which subjects you have completed. Read-only.",
     input: { lang },
-    run: async (a) => compactStudyPlan(pickLang(await fetchDualLanguageStudyPlan((await study()).studium), a.lang))
+    run: async (a, ctx) => {
+      const plan2 = await fetchDualLanguageStudyPlan((await study(ctx)).studium);
+      if (!plan2) throw new Error("IS Mendelu did not return your study plan. Try again.");
+      return compactStudyPlan(pickLang(plan2, a.lang));
+    }
   },
   {
     name: "mendelu_syllabus",
@@ -111481,10 +112460,10 @@ const TOOLS = [
   {
     name: "mendelu_subject_files",
     title: "Subject files",
-    description: "Lists the files in one enrolled subject's IS document folder (slides, materials): name, author, date and a downloadUrl to pass to mendelu_read_file. Read-only.",
+    description: "Lists the files in one enrolled subject's IS document folder (slides, materials): the document's name, the file's own name (one document can hold several files), folder, author, date, modified, and a downloadUrl to pass to mendelu_read_file. A file whose original is already saved on this computer also has a `localPath`, relative to the folder named in `savedFiles`: open it there with your own file tools. Read-only.",
     input: { code: string().min(2).describe('Subject code, e.g. "EBC-PS".') },
-    run: async (a) => {
-      const folderUrl = (await subjectsData())[String(a.code)]?.folderUrl;
+    run: async (a, ctx) => {
+      const folderUrl = (await subjectsData(ctx))[String(a.code)]?.folderUrl;
       if (typeof folderUrl !== "string") {
         throw new Error(`${String(a.code)} is not enrolled this semester, or has no file folder.`);
       }
@@ -111508,12 +112487,25 @@ const TOOLS = [
     run: (a) => fetchSubjectSuccessRates(a.codes)
   },
   {
+    name: "mendelu_points",
+    title: "My points in a subject",
+    description: "Your points so far in one enrolled subject, from its IS Záznamník: the teacher's continuous-assessment tables (průběžné hodnocení: tests, homework, attendance columns with your row of values) and your graded online tests with score, max score and date. Use it to work out what the student still needs to pass; take the pass rules from mendelu_syllabus. Read-only.",
+    input: { code: string().min(2).describe('Subject code, e.g. "EBC-PS".') },
+    run: async (a, ctx) => {
+      const subjectId = (await subjectsData(ctx))[String(a.code)]?.subjectId;
+      if (typeof subjectId !== "string") {
+        throw new Error(`${String(a.code)} is not enrolled this semester.`);
+      }
+      return pointsFor(subjectId, ctx);
+    }
+  },
+  {
     name: "mendelu_grades",
     title: "My grades",
     description: "Your grades and credits across all semesters so far (Průchod studiem): subject, grade, credits, attempt and date. Read-only.",
     input: {},
-    run: async () => {
-      const { studium, obdobi } = await study();
+    run: async (_a2, ctx) => {
+      const { studium, obdobi } = await study(ctx);
       const grades = await fetchGradeHistory(studium, obdobi);
       if (!grades) throw new Error("IS Mendelu did not return your grades. Try again.");
       return grades;
@@ -111524,18 +112516,7 @@ const TOOLS = [
     title: "My assignment deadlines",
     description: 'Your submission boxes (Odevzdávárny): subject, assignment, deadline, whether it is still open, files uploaded, points, and the teacher `instructions` (IS "Pokyny": what to hand in and how) when the box has any. Pass the instructions on when the student asks what to submit. IS takes a submission in two steps, upload then confirm, so each box has a `submission` field: only "handed_in" (section "submitted") means it is handed in. "uploaded_not_confirmed" is an open box with files that is NOT confirmed in IS: tell the student to confirm it in IS, never that it is handed in. Read-only: it never submits or confirms anything.',
     input: {},
-    run: async () => {
-      const { studium, obdobi } = await study();
-      const res = await fetchOdevzdavarny(studium, obdobi);
-      if (!res) return null;
-      return {
-        ...res,
-        assignments: res.assignments.map((r2) => ({
-          ...omit(r2, ["uploadUrl", "odevzdavarnaId"]),
-          ...submissionOf(r2)
-        }))
-      };
-    }
+    run: (_a2, ctx) => assignmentsData(ctx)
   }
 ];
 const isEmpty = (v) => v === null || v === void 0 || v === "" || Array.isArray(v) && v.length === 0;
@@ -111624,14 +112605,3079 @@ function handoverResult({ handover: h }) {
     ]
   };
 }
+const isReplacement = (v) => !!v && typeof v === "object" && "replaceWith" in v && !!v.replaceWith;
+const genOf = (token) => token && typeof token === "object" && "gen" in token ? token.gen : token;
+function stable(v) {
+  if (Array.isArray(v)) return v.map(stable);
+  if (v && typeof v === "object") {
+    return Object.fromEntries(
+      Object.keys(v).sort().map((k) => [k, stable(v[k])])
+    );
+  }
+  return v;
+}
+function keyOf(tool, args) {
+  const { response_format: _format, ...rest } = args;
+  return `${tool} ${JSON.stringify(stable(rest))}`;
+}
+const MIN = 6e4;
+const HOUR = 60 * MIN;
+const READ$1 = "mendelu_read_file";
+const LIST$1 = "mendelu_subject_files";
+const TTL_MS = {
+  mendelu_assignments: MIN,
+  mendelu_exams: MIN,
+  mendelu_points: MIN,
+  mendelu_grades: MIN,
+  [LIST$1]: 5 * MIN,
+  mendelu_schedule: 15 * MIN,
+  // Also dropped as soon as its folder listing shows another date for the file.
+  [READ$1]: HOUR,
+  mendelu_subjects: HOUR,
+  mendelu_study_plan: HOUR,
+  mendelu_syllabus: 24 * HOUR,
+  // fetchSubjectSuccessRates keeps what it fetched itself and asks again for a
+  // subject whose request failed; an answer kept here would hide that retry.
+  mendelu_success_rates: 0
+};
+const MAX_BYTES = 64 * 1024 * 1024;
+const stampOf = (f) => f.modified ? `modified ${String(f.modified)}` : `date ${String(f.date ?? "")}`;
+function createToolCache({
+  now = Date.now,
+  maxBytes = MAX_BYTES,
+  persist
+} = {}) {
+  const entries2 = /* @__PURE__ */ new Map();
+  const inflight = /* @__PURE__ */ new Map();
+  const fileStamps = /* @__PURE__ */ new Map();
+  let total = 0;
+  let epoch = 0;
+  let [seen, seenGen] = [false, void 0];
+  const drop = (key) => {
+    const e = entries2.get(key);
+    if (!e) return;
+    total -= e.bytes;
+    entries2.delete(key);
+  };
+  const keep = (key, value2, stamp) => {
+    const bytes = 2 * (key.length + (JSON.stringify(value2)?.length ?? 0));
+    if (bytes > maxBytes) return;
+    drop(key);
+    entries2.set(key, { value: value2, at: now(), bytes, stamp });
+    total += bytes;
+    for (const oldest of entries2.keys()) {
+      if (total <= maxBytes) break;
+      drop(oldest);
+    }
+  };
+  const noteListing = (files2) => {
+    if (!Array.isArray(files2)) return;
+    for (const f of files2) {
+      if (typeof f?.downloadUrl !== "string") continue;
+      const stamp = stampOf(f);
+      fileStamps.set(f.downloadUrl, stamp);
+      const key = keyOf(READ$1, { url: f.downloadUrl });
+      if (entries2.has(key) && entries2.get(key).stamp !== stamp) drop(key);
+      if (inflight.has(key) && inflight.get(key).stamp !== stamp) inflight.delete(key);
+    }
+  };
+  const clear = () => {
+    epoch++;
+    entries2.clear();
+    inflight.clear();
+    fileStamps.clear();
+    total = 0;
+  };
+  return {
+    /** Forget everything held here, including reads still in flight (forget everything). */
+    clear,
+    /** One per call, first; pass it to run(). A new folder token = a forget in another window. */
+    async ticket() {
+      const started = epoch;
+      const token = await persist?.begin().catch(() => null);
+      const gen = genOf(token);
+      const forgot = seen && gen !== seenGen;
+      [seen, seenGen] = [true, gen];
+      const stale = epoch !== started;
+      if (forgot) clear();
+      return { epoch: stale ? started : epoch, token };
+    },
+    async run(tool, args, fetch2, ticket, { fresh = false } = {}) {
+      const ttl = TTL_MS[tool];
+      if (!ttl) return fetch2();
+      const key = keyOf(tool, args);
+      const hit = fresh ? void 0 : entries2.get(key);
+      const live = async (h) => await persist?.stillValid?.(tool, args, h.value, h.stamp).catch(() => false) ?? true;
+      const seen2 = epoch;
+      if (hit && now() - hit.at < ttl && await live(hit) && entries2.get(key) === hit && epoch === seen2) {
+        entries2.delete(key);
+        entries2.set(key, hit);
+        return hit.value;
+      }
+      if (fresh || entries2.get(key) === hit) drop(key);
+      const pending = fresh ? void 0 : inflight.get(key);
+      if (pending) return pending.promise;
+      const mine = {
+        promise: Promise.resolve(),
+        stamp: tool === READ$1 ? fileStamps.get(String(args.url)) : void 0
+      };
+      const fromFetch = () => fetch2().then((value2) => ({ value: value2, stored: false }));
+      const began = ticket ?? { epoch, token: persist?.begin().catch(() => null) };
+      const obtained = persist ? persist.load(tool, args, mine.stamp).catch(() => void 0).then((value2) => value2 !== void 0 ? { value: value2, stored: true } : fromFetch()) : fromFetch();
+      mine.promise = obtained.then(async ({ value: value2, stored }) => {
+        const current2 = inflight.get(key) === mine && epoch === began.epoch;
+        if (tool === LIST$1 && current2) noteListing(value2);
+        if (current2) keep(key, value2, mine.stamp);
+        if (current2 && !stored) {
+          const saved = await persist?.save(tool, args, value2, mine.stamp, await began.token).catch(() => void 0);
+          if (isReplacement(saved) && inflight.get(key) === mine && epoch === began.epoch)
+            keep(key, saved.replaceWith, mine.stamp);
+        }
+        return value2;
+      });
+      inflight.set(key, mine);
+      try {
+        return await mine.promise;
+      } finally {
+        if (inflight.get(key) === mine) inflight.delete(key);
+      }
+    }
+  };
+}
+function readAfterModified(stamp, readAt) {
+  const m = /^modified\s+(\d{1,2})\.\s*(\d{1,2})\.\s*(\d{4})/.exec(stamp);
+  const read = new Date(String(readAt));
+  if (!m || Number.isNaN(read.getTime())) return false;
+  try {
+    const modified = `${m[3]}-${m[2].padStart(2, "0")}-${m[1].padStart(2, "0")}`;
+    return read.toLocaleDateString("en-CA", { timeZone: "Europe/Prague" }) > modified;
+  } catch {
+    return false;
+  }
+}
+const isObject$4 = (v) => !!v && typeof v === "object" && !Array.isArray(v);
+const textPath = (url2) => `text/${createHash("sha256").update(url2).digest("hex").slice(0, 32)}.json`;
+const textBody = (url2, stamp, value2) => ({
+  url: url2,
+  stamp: stamp || null,
+  kind: value2.kind,
+  file: value2
+});
+const recordBytes = (body2, at) => Buffer.byteLength(JSON.stringify({ savedAt: new Date(at).toISOString(), ...body2 }));
+function isKept(m, url2, stamp, extractsText) {
+  if (m.url !== url2 || m.stamp !== stamp) return false;
+  if (!readAfterModified(stamp, m.savedAt)) return false;
+  return extractsText || m.kind === "text";
+}
+function keptText(rec, url2, stamp, extractsText) {
+  if (!isObject$4(rec)) return void 0;
+  const f = rec.file;
+  if (!isObject$4(f) || typeof f.text !== "string" || typeof f.kind !== "string") return void 0;
+  return isKept(
+    { url: rec.url, stamp: rec.stamp, savedAt: rec.savedAt, kind: f.kind },
+    url2,
+    stamp,
+    extractsText
+  ) ? f : void 0;
+}
+const HEAD = 2048;
+const STR = String.raw`"(?:[^"\\]|\\.)*"`;
+const HEADER = new RegExp(
+  String.raw`^\{"savedAt":("[^"]*"),"url":(${STR}),"stamp":(${STR}|null)(?:,"kind":("[^"]*"))?`
+);
+async function textIsKept(store2, path2, url2, stamp, extractsText) {
+  const m = HEADER.exec(await store2.readHead(path2, HEAD) ?? "");
+  if (!m) return false;
+  try {
+    const [savedAt, u, st, kind2] = m.slice(1).map((x3) => x3 ? JSON.parse(x3) : void 0);
+    return isKept({ url: u, stamp: st, savedAt, kind: kind2 }, url2, stamp, extractsText);
+  } catch {
+    return false;
+  }
+}
+const FOLDER = "reIS for Claude";
+function resolveStoreDir({
+  platform = process.platform,
+  env = process.env,
+  homedir: homedir$1 = homedir()
+} = {}) {
+  if (platform === "win32") {
+    const local = env.LOCALAPPDATA;
+    const base2 = local && path.win32.isAbsolute(local) ? local : path.win32.join(homedir$1, "AppData", "Local");
+    return path.win32.join(base2, FOLDER);
+  }
+  if (platform === "darwin") {
+    return path.posix.join(homedir$1, "Library", "Application Support", FOLDER);
+  }
+  const xdg = env.XDG_DATA_HOME;
+  const base = xdg && path.posix.isAbsolute(xdg) ? xdg : path.posix.join(homedir$1, ".local", "share");
+  return path.posix.join(base, FOLDER);
+}
+class StorePathError extends Error {
+  constructor(reason2) {
+    super(`Invalid store path: ${reason2}`);
+    this.name = "StorePathError";
+  }
+}
+const INDEX_FILE = "index.json";
+const TEMP_PREFIX = ".tmp-";
+const GEN_FILE = ".generation";
+const FORGET_PREFIX = ".forgetting-";
+const fold = (p) => p.normalize("NFC").toLowerCase();
+const MAX_PATH = 200;
+const OS_MAX_PATH = path.sep === "\\" ? 259 : Infinity;
+const MAX_SEGMENT_BYTES = 255;
+const BAD_CHARS = /[\u0000-\u001f\u007f<>:"|?*\\]/;
+const DEVICE$1 = /^(con|prn|aux|nul|com[0-9\u00b9\u00b2\u00b3]|lpt[0-9\u00b9\u00b2\u00b3]|conin\$|conout\$) *(\..*)?$/i;
+function safeRelPath(input) {
+  if (typeof input !== "string") throw new StorePathError("not a string");
+  const p = input.normalize("NFC");
+  if (!p.trim()) throw new StorePathError("empty");
+  if (p.length > MAX_PATH) throw new StorePathError("too long");
+  if (p.startsWith("/")) throw new StorePathError("absolute");
+  if (BAD_CHARS.test(p)) throw new StorePathError("forbidden character");
+  const segments = p.split("/");
+  for (const s of segments) {
+    if (!s || s === "." || s === "..") throw new StorePathError("empty, . or .. segment");
+    if (/[. ]$/.test(s)) throw new StorePathError("segment ends with a dot or space");
+    if (Buffer.byteLength(s) > MAX_SEGMENT_BYTES) throw new StorePathError("name too long");
+    if (DEVICE$1.test(s)) throw new StorePathError("reserved device name");
+    if (s.toLowerCase().startsWith(TEMP_PREFIX)) throw new StorePathError("reserved temp name");
+  }
+  if ([INDEX_FILE, GEN_FILE].includes(fold(segments[0])) || fold(segments[0]).startsWith(FORGET_PREFIX))
+    throw new StorePathError("reserved name");
+  return p;
+}
+function insideDir(dir, rel) {
+  const full = path.join(dir, ...safeRelPath(rel).split("/"));
+  if (!full.startsWith(dir + path.sep)) throw new StorePathError("escapes the store folder");
+  return full;
+}
+const ORIGINALS = "originals";
+const META = ".reis-original.json";
+const originalDir = (url2) => `${ORIGINALS}/${createHash("sha256").update(url2).digest("hex").slice(0, 32)}`;
+const metaPath = (url2) => `${originalDir(url2)}/${META}`;
+const MAX_BASE_BYTES = 120;
+const UNSAFE = /[\u0000-\u001f\u007f<>:"|?*\\/]/g;
+const DEVICE = /^(con|prn|aux|nul|com[0-9\u00b9\u00b2\u00b3]|lpt[0-9\u00b9\u00b2\u00b3]|conin\$|conout\$)$/i;
+function cutBytes(s, max) {
+  let out = "";
+  let used = 0;
+  for (const ch of s) {
+    const n = Buffer.byteLength(ch);
+    if (used + n > max) break;
+    out += ch;
+    used += n;
+  }
+  return out;
+}
+function safeFileName(raw) {
+  const s = (typeof raw === "string" ? raw : "").normalize("NFC").replace(UNSAFE, "_").replace(/\.{2,}/g, ".").replace(/^[\s.]+/, "").replace(/[\s.]+$/, "");
+  const ext = /\.[A-Za-z0-9]{1,10}$/.exec(s)?.[0] ?? "";
+  let base = s.slice(0, s.length - ext.length).replace(/[\s.]+$/, "");
+  if (DEVICE.test((base.split(".")[0] ?? "").trim())) base = `_${base}`;
+  base = cutBytes(base, MAX_BASE_BYTES).replace(/[\s.]+$/, "");
+  const name2 = `${base || "file"}${ext}`;
+  try {
+    safeRelPath(`${ORIGINALS}/x/${name2}`);
+    return name2;
+  } catch {
+    return `file${ext}`;
+  }
+}
+function recordOf(o) {
+  return {
+    savedAt: new Date(o.at).toISOString(),
+    url: o.url,
+    stamp: o.stamp,
+    file: safeFileName(o.filename),
+    bytes: typeof o.bytes === "number" ? o.bytes : o.bytes.byteLength,
+    ...o.mediaType ? { mediaType: o.mediaType } : {}
+  };
+}
+const originalCost = (r2) => r2.bytes + Buffer.byteLength(JSON.stringify(r2));
+const dayOf = (stamp) => {
+  const m = /(\d{1,2})\.\s*(\d{1,2})\.\s*(\d{4})/.exec(stamp);
+  return m ? Number(`${m[3]}${m[2].padStart(2, "0")}${m[1].padStart(2, "0")}`) : 0;
+};
+const isObject$3 = (v) => !!v && typeof v === "object" && !Array.isArray(v);
+function createOriginals(store2, now = Date.now) {
+  async function meta(url2) {
+    try {
+      const m = JSON.parse(await store2.readText(metaPath(url2)) ?? "null");
+      if (!isObject$3(m) || m.url !== url2 || typeof m.file !== "string") return void 0;
+      if (typeof m.stamp !== "string" || typeof m.savedAt !== "string") return void 0;
+      if (m.file !== safeFileName(m.file)) return void 0;
+      return m;
+    } catch {
+      return void 0;
+    }
+  }
+  async function kept(url2, stamp) {
+    const m = await meta(url2);
+    if (!m || m.stamp !== stamp || !readAfterModified(stamp, m.savedAt)) return void 0;
+    const rel = `${originalDir(url2)}/${m.file}`;
+    return await store2.diskPath(rel) ? rel : void 0;
+  }
+  async function keptPath(url2, stamp) {
+    const rel = await kept(url2, stamp);
+    return rel && store2.diskPath(rel);
+  }
+  async function handBack(url2, stamp) {
+    const m = await meta(url2);
+    const path2 = await keptPath(url2, stamp);
+    if (!m || !path2) return void 0;
+    return {
+      filename: m.file,
+      kind: "saved file",
+      localPath: path2,
+      bytes: m.bytes,
+      note: "This file is saved on this computer, unchanged since IS last listed it. Read it from localPath with your own file tools (a PDF directly; DOCX, PPTX, XLSX and ODT are zip archives of XML)."
+    };
+  }
+  async function save(o) {
+    const dir = originalDir(o.url);
+    const file = safeFileName(o.filename);
+    const rel = `${dir}/${file}`;
+    const after = o.token ? { after: o.token.gen } : {};
+    const record2 = recordOf({ ...o, at: o.token?.at ?? now() });
+    return store2.exclusive(`original-${dir.slice(ORIGINALS.length + 1)}`, async () => {
+      const held = await meta(o.url);
+      if (held && dayOf(held.stamp) > dayOf(o.stamp)) return void 0;
+      if (!await store2.write(rel, o.bytes, after)) return void 0;
+      if (!await store2.write(metaPath(o.url), JSON.stringify(record2), after)) return void 0;
+      for (const e of await store2.listFolder(dir))
+        if (e.path !== rel && e.path !== metaPath(o.url))
+          await store2.remove(e.path).catch(() => {
+          });
+      return await store2.readHead(rel, 1) === void 0 ? void 0 : rel;
+    });
+  }
+  return { kept, keptPath, handBack, save, meta };
+}
+const SUBJECTS = "mendelu_subjects";
+const LIST = "mendelu_subject_files";
+const READ = "mendelu_read_file";
+const PROFILE_FIELDS = [
+  "facultyLabel",
+  "studyProgram",
+  "studyForm",
+  "studyCode",
+  "studyYear",
+  "studySemester",
+  "periodLabel"
+];
+const isObject$2 = (v) => !!v && typeof v === "object" && !Array.isArray(v);
+const isToken$1 = (t) => isObject$2(t) && "gen" in t && "at" in t;
+function createMapPersist(store2, {
+  now = Date.now,
+  // false in the plugin build: it hands documents over whole, so it must not serve
+  // the text the other build extracted, and it saves only text-native files.
+  extractsText = true
+} = {}) {
+  let lastProfile = "";
+  let lastGen;
+  let profileWrite = Promise.resolve();
+  const originals = createOriginals(store2, now);
+  const put = async (path2, body2, token) => {
+    try {
+      const at = isToken$1(token) ? token.at : now();
+      return await store2.write(
+        path2,
+        JSON.stringify({ savedAt: new Date(at).toISOString(), ...body2 }),
+        isToken$1(token) ? { after: token.gen } : {}
+      );
+    } catch {
+      return false;
+    }
+  };
+  const persist = {
+    // The time is taken first: a read that crosses midnight began on the earlier day.
+    begin: async () => {
+      const at = now();
+      return { gen: await store2.generation(), at };
+    },
+    async load(tool, args, stamp) {
+      if (tool !== READ || !stamp || typeof args.url !== "string") return void 0;
+      try {
+        const path2 = extractsText ? void 0 : await originals.handBack(args.url, stamp);
+        if (path2) return path2;
+        const rec = JSON.parse(await store2.readText(textPath(args.url)) ?? "null");
+        return keptText(rec, args.url, stamp, extractsText);
+      } catch {
+        return void 0;
+      }
+    },
+    async stillValid(tool, args, value2, stamp) {
+      if (tool !== READ || !isObject$2(value2) || value2.kind !== "saved file") return true;
+      return !!stamp && typeof args.url === "string" && !!await originals.kept(args.url, stamp);
+    },
+    async save(tool, args, value2, stamp, token) {
+      if (tool === SUBJECTS) {
+        await put("subjects.json", { subjects: value2 }, token);
+        return;
+      }
+      if (tool === LIST && typeof args.code === "string") {
+        await put(`listings/${args.code}.json`, { code: args.code, files: value2 }, token);
+      }
+      const original = tool === READ ? takeOriginal(value2) : void 0;
+      const kept = original && stamp && typeof args.url === "string" ? await originals.save({ url: args.url, stamp, ...original, token }).catch(() => void 0) : void 0;
+      if (kept && !extractsText && isObject$2(value2) && "handover" in value2) {
+        const path2 = await originals.handBack(args.url, stamp);
+        return path2 ? { replaceWith: path2 } : void 0;
+      }
+      if (tool === READ && typeof args.url === "string" && isObject$2(value2)) {
+        if (typeof value2.text !== "string" || typeof value2.kind !== "string") return;
+        if (!extractsText && value2.kind !== "text") return;
+        await put(textPath(args.url), textBody(args.url, stamp, value2), token);
+      }
+    }
+  };
+  async function saveProfile(params, token) {
+    if (!isObject$2(params)) return;
+    const profile = {};
+    for (const k of PROFILE_FIELDS) {
+      const v = params[k];
+      if (typeof v === "string" && v || typeof v === "number") profile[k] = v;
+    }
+    const body2 = JSON.stringify(profile);
+    const gen = isToken$1(token) ? token.gen : void 0;
+    if (body2 === "{}" || body2 === lastProfile && gen === lastGen) return;
+    profileWrite = put("profile.json", profile, token).then((kept) => {
+      if (kept) [lastProfile, lastGen] = [body2, gen];
+      return kept;
+    });
+    await profileWrite;
+  }
+  const settled = () => profileWrite;
+  const reset = () => {
+    lastProfile = "";
+    lastGen = void 0;
+  };
+  const saveText = (url2, value2, stamp, token) => isObject$2(value2) && typeof value2.text === "string" && typeof value2.kind === "string" && (extractsText || value2.kind === "text") ? put(textPath(url2), textBody(url2, stamp, value2), token) : Promise.resolve(false);
+  return { persist, saveProfile, settled, reset, saveText };
+}
+const DAY = 864e5;
+const ZONE = "Europe/Prague";
+const parts = new Intl.DateTimeFormat("en-CA", {
+  timeZone: ZONE,
+  hourCycle: "h23",
+  year: "numeric",
+  month: "numeric",
+  day: "numeric",
+  hour: "numeric",
+  minute: "numeric",
+  second: "numeric"
+});
+function pragueWall(at) {
+  const p = Object.fromEntries(parts.formatToParts(at).map((x3) => [x3.type, Number(x3.value)]));
+  return Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second);
+}
+const pragueToday = (at) => Math.floor(pragueWall(at) / DAY) * DAY;
+function pragueAsLocal(at) {
+  const p = Object.fromEntries(parts.formatToParts(at).map((x3) => [x3.type, Number(x3.value)]));
+  return new Date(p.year, p.month - 1, p.day, p.hour, p.minute, p.second).getTime();
+}
+function parsePrague(date2, time2 = "") {
+  const m = /(\d{1,2})\.\s*(\d{1,2})\.\s*(\d{4})(?:\s+(\d{1,2}):(\d{2}))?/.exec(
+    `${date2} ${time2}`.trim()
+  );
+  if (!m) return null;
+  const wall = Date.UTC(
+    Number(m[3]),
+    Number(m[2]) - 1,
+    Number(m[1]),
+    Number(m[4] ?? 23),
+    Number(m[5] ?? 59)
+  );
+  let at = wall - (pragueWall(wall) - wall);
+  at = wall - (pragueWall(at) - at);
+  return { at, day: Math.floor(wall / DAY) * DAY };
+}
+const isObject$1 = (v) => !!v && typeof v === "object" && !Array.isArray(v);
+const list$1 = (v) => Array.isArray(v) ? v.filter(isObject$1) : [];
+const str$1 = (v) => typeof v === "string" || typeof v === "number" ? String(v).trim() : "";
+function uniqueKeys(sep) {
+  const used = /* @__PURE__ */ new Set();
+  const count = /* @__PURE__ */ new Map();
+  return (base) => {
+    let n = count.get(base) ?? 0;
+    let key;
+    do
+      key = ++n > 1 ? `${base}${sep}${n}` : base;
+    while (used.has(key));
+    count.set(base, n);
+    used.add(key);
+    return key;
+  };
+}
+function pointRows(value2) {
+  const v = isObject$1(value2) ? value2 : {};
+  const rows2 = [];
+  const unique = uniqueKeys(" #");
+  for (const section of list$1(v.continuousAssessment)) {
+    for (const arch of list$1(section.arches)) {
+      if (arch.empty === true) continue;
+      const columns = Array.isArray(arch.columns) ? arch.columns.map(str$1) : [];
+      const values2 = Array.isArray(arch.values) ? arch.values.map(str$1) : [];
+      const cells2 = values2.map((x3, i) => columns[i] ? `${columns[i]}=${x3}` : x3).filter(Boolean);
+      if (!cells2.length) continue;
+      rows2.push({
+        key: unique(`${str$1(section.label)} / ${str$1(arch.name)}`),
+        text: cells2.join(", ")
+      });
+    }
+  }
+  for (const t of list$1(v.tests)) {
+    const when = str$1(t.submittedAt);
+    rows2.push({
+      key: unique(`test / ${str$1(t.name)} / ${when}`),
+      text: `${str$1(t.name)}: ${str$1(t.score)}/${str$1(t.maxScore)}${when ? ` (${when})` : ""}`
+    });
+  }
+  return rows2;
+}
+function boxRows(value2, now) {
+  const unique = uniqueKeys("|");
+  const rows2 = list$1(isObject$1(value2) ? value2.assignments : []);
+  const label2 = (r2) => `${str$1(r2.courseCode) || str$1(r2.courseId)}|${str$1(r2.name)}`;
+  const seen = /* @__PURE__ */ new Map();
+  for (const r2 of rows2) seen.set(label2(r2), (seen.get(label2(r2)) ?? 0) + 1);
+  return rows2.map((r2) => {
+    const code2 = str$1(r2.courseCode) || str$1(r2.courseId);
+    const name2 = str$1(r2.name);
+    const id2 = str$1(r2.odevzdavarnaId);
+    const base = id2 ? `${code2}|#${id2}` : (seen.get(label2(r2)) ?? 0) > 1 ? `${label2(r2)}|${str$1(r2.deadline)}` : label2(r2);
+    return {
+      key: unique(base),
+      code: code2,
+      name: name2,
+      deadline: str$1(r2.deadline),
+      open: isBoxOpen(r2, pragueAsLocal(now)),
+      submission: str$1(r2.submission),
+      points: str$1(r2.points)
+    };
+  });
+}
+const dayKey = (d) => {
+  const m = /(\d{1,2})\.\s*(\d{1,2})\.\s*(\d{4})/.exec(d);
+  return m ? `${m[3]}${m[2].padStart(2, "0")}${m[1].padStart(2, "0")}` : d;
+};
+function examRows(value2) {
+  const rows2 = [];
+  for (const subject of list$1(value2)) {
+    const code2 = str$1(subject.code);
+    for (const s of list$1(subject.sections)) {
+      const section = str$1(s.name) || str$1(s.type);
+      const sid = str$1(s.id);
+      const reg = isObject$1(s.registeredTerm) ? s.registeredTerm : null;
+      if (reg) {
+        const id2 = str$1(reg.id) || `${str$1(reg.date)} ${str$1(reg.time)}`;
+        rows2.push({
+          key: `${code2}|${sid}|${id2}`,
+          code: code2,
+          section,
+          state: "registered",
+          date: str$1(reg.date),
+          time: str$1(reg.time),
+          room: str$1(reg.room)
+        });
+      }
+      for (const t of list$1(s.terms)) {
+        const id2 = str$1(t.id) || `${str$1(t.date)} ${str$1(t.time)}`;
+        const key = `${code2}|${sid}|${id2}`;
+        if (rows2.some((r2) => r2.key === key)) continue;
+        rows2.push({
+          key,
+          code: code2,
+          section,
+          state: t.full === true ? "full" : "open",
+          date: str$1(t.date),
+          time: str$1(t.time),
+          room: str$1(t.room)
+        });
+      }
+    }
+  }
+  return rows2.sort((a, b) => dayKey(a.date).localeCompare(dayKey(b.date)));
+}
+function weekRows(rows2) {
+  return rows2.map((r2) => ({
+    date: r2.date,
+    time: `${r2.start}-${r2.end}`,
+    code: r2.code,
+    kind: r2.kind,
+    room: r2.room
+  }));
+}
+const CONCURRENCY$1 = 4;
+const text$1 = (v) => typeof v === "string" ? v.trim() : "";
+const modifiedOf = (f) => f.modified || f.date || "";
+const labelOf$1 = (f) => f.file || f.name;
+async function pool$1(tasks) {
+  let next = 0;
+  const worker = async () => {
+    while (next < tasks.length) await tasks[next++]();
+  };
+  await Promise.all(Array.from({ length: Math.min(CONCURRENCY$1, tasks.length) }, worker));
+}
+async function gather(run, ctx, now) {
+  const data2 = await subjectsData(ctx);
+  const subjects = Object.entries(data2).map(([code2, s]) => ({
+    code: code2,
+    name: text$1(s.nameCs) || text$1(s.displayName) || text$1(s.name) || text$1(s.fullName),
+    ...typeof s.subjectId === "string" ? { subjectId: s.subjectId } : {},
+    ...typeof s.folderUrl === "string" ? { folderUrl: s.folderUrl } : {}
+  }));
+  const problems = [];
+  const g2 = {
+    subjects,
+    listings: {},
+    world: { subjects: subjects.map(({ code: code2, name: name2 }) => ({ code: code2, name: name2 })), files: {}, points: {} },
+    problems
+  };
+  const attempt = async (label2, fn) => {
+    try {
+      await fn();
+    } catch (e) {
+      const m = (e instanceof Error ? e.message : String(e)).split("\n")[0].slice(0, 120);
+      problems.push(`${label2}: ${m}`);
+    }
+  };
+  const viaTool = (name2, args) => {
+    const tool = TOOLS.find((t) => t.name === name2);
+    return run(name2, args, () => tool.run(args, ctx));
+  };
+  const tasks = [];
+  for (const s of subjects) {
+    const { code: code2, folderUrl, subjectId } = s;
+    if (folderUrl) {
+      tasks.push(
+        () => attempt(`files of ${code2}`, async () => {
+          const files2 = await run(
+            "mendelu_subject_files",
+            { code: code2 },
+            () => listFolderFiles(folderUrl)
+          );
+          g2.listings[code2] = files2;
+          g2.world.files[code2] = files2.map((f) => ({
+            url: f.downloadUrl,
+            label: labelOf$1(f),
+            modified: modifiedOf(f)
+          }));
+        })
+      );
+    }
+    if (subjectId) {
+      tasks.push(
+        () => attempt(`points of ${code2}`, async () => {
+          const z2 = await run("mendelu_points", { code: code2 }, () => pointsFor(subjectId, ctx));
+          g2.world.points[code2] = pointRows(z2);
+        })
+      );
+    }
+  }
+  tasks.push(
+    () => attempt("assignments", async () => {
+      g2.boxes = boxRows(
+        await run("overview_assignments", {}, () => assignmentsData(ctx, true)),
+        now.getTime()
+      );
+      g2.world.boxes = g2.boxes;
+    })
+  );
+  tasks.push(
+    () => attempt("exams", async () => {
+      g2.exams = examRows(await viaTool("mendelu_exams", {}));
+      g2.world.exams = g2.exams;
+    })
+  );
+  tasks.push(
+    () => attempt("timetable", async () => {
+      const end2 = new Date(now);
+      end2.setDate(end2.getDate() + 7);
+      const from = isoDay(now);
+      const to = isoDay(end2);
+      const lessons = await viaTool("mendelu_schedule", { from, to });
+      g2.week = weekRows(Array.isArray(lessons) ? lessons : []);
+    })
+  );
+  await pool$1(tasks);
+  return g2;
+}
+const own = (o, k) => !!o && Object.hasOwn(o, k);
+const hash = (s) => createHash("sha256").update(s).digest("hex").slice(0, 12);
+const isRecord = (v) => !!v && typeof v === "object" && !Array.isArray(v);
+function parseSnapshot(raw) {
+  try {
+    const s = JSON.parse(raw ?? "null");
+    if (!isRecord(s) || s.version !== 1) return null;
+    if (!isRecord(s.subjects) || !isRecord(s.files) || !isRecord(s.points)) return null;
+    return s;
+  } catch {
+    return null;
+  }
+}
+function snapshotOf(world, prev) {
+  const next = { version: 1, subjects: {}, files: {}, points: {} };
+  for (const s of world.subjects) {
+    next.subjects[s.code] = s.name;
+    const files2 = world.files[s.code];
+    const kept = prev?.files[s.code];
+    if (files2) {
+      next.files[s.code] = Object.fromEntries(
+        files2.map((f) => [f.url, { n: f.label, m: f.modified }])
+      );
+    } else if (kept) next.files[s.code] = kept;
+    const points2 = world.points[s.code];
+    const keptPoints = prev?.points[s.code];
+    if (points2) next.points[s.code] = Object.fromEntries(points2.map((p) => [p.key, hash(p.text)]));
+    else if (keptPoints) next.points[s.code] = keptPoints;
+  }
+  const boxes = world.boxes ? Object.fromEntries(world.boxes.map((b) => [b.key, { n: b.name, c: b.code, d: b.deadline }])) : prev?.boxes;
+  if (boxes) next.boxes = boxes;
+  const exams = world.exams ? Object.fromEntries(world.exams.map((e) => [e.key, `${e.date} ${e.time}`.trim()])) : prev?.exams;
+  if (exams) next.exams = exams;
+  return next;
+}
+function diffWorld(prev, world) {
+  const out = [];
+  const names2 = new Map(world.subjects.map((s) => [s.code, s.name]));
+  const fresh = /* @__PURE__ */ new Set();
+  for (const s of world.subjects) {
+    if (!own(prev.subjects, s.code)) {
+      fresh.add(s.code);
+      out.push({ kind: "subject", code: s.code, text: `New subject: ${s.code} ${s.name}`.trim() });
+    }
+  }
+  for (const code2 of Object.keys(prev.subjects)) {
+    if (!names2.has(code2)) {
+      out.push({ kind: "subject", code: code2, text: `Subject no longer listed in IS: ${code2}` });
+    }
+  }
+  for (const code2 of names2.keys()) {
+    if (fresh.has(code2)) continue;
+    const files2 = world.files[code2];
+    if (files2) out.push(...fileChanges(code2, prev.files[code2] ?? {}, files2));
+    const points2 = world.points[code2];
+    if (points2) out.push(...pointChanges(code2, prev.points[code2] ?? {}, points2));
+  }
+  if (world.boxes) out.push(...boxChanges(prev.boxes ?? {}, world.boxes));
+  if (world.exams) {
+    const seen = prev.exams ?? {};
+    for (const e of world.exams) {
+      if (e.state === "registered" || own(seen, e.key)) continue;
+      out.push({
+        kind: "exam",
+        code: e.code,
+        key: e.key,
+        text: `New exam term in ${e.code}: ${e.section} ${e.date} ${e.time}${e.room ? ` ${e.room}` : ""}`.trim()
+      });
+    }
+  }
+  return out;
+}
+function fileChanges(code2, before, files2) {
+  const out = [];
+  const now = /* @__PURE__ */ new Set();
+  for (const f of files2) {
+    now.add(f.url);
+    const was = own(before, f.url) ? before[f.url] : void 0;
+    if (!was) {
+      out.push({
+        kind: "file",
+        what: "new",
+        code: code2,
+        url: f.url,
+        text: `New file in ${code2}: ${f.label} (${f.modified})`
+      });
+    } else if (was.m !== f.modified) {
+      out.push({
+        kind: "file",
+        what: "replaced",
+        code: code2,
+        url: f.url,
+        text: `Replaced file in ${code2}: ${f.label} (modified ${was.m} -> ${f.modified})`
+      });
+    }
+  }
+  for (const [url2, was] of Object.entries(before)) {
+    if (!now.has(url2)) {
+      out.push({
+        kind: "file",
+        what: "gone",
+        code: code2,
+        was: url2,
+        text: `File gone from IS in ${code2}: ${was.n}`
+      });
+    }
+  }
+  return out;
+}
+function pointChanges(code2, before, points2) {
+  const out = [];
+  for (const p of points2) {
+    if (!own(before, p.key)) {
+      out.push({ kind: "points", code: code2, key: p.key, text: `New points row in ${code2}: ${p.key}` });
+    } else if (before[p.key] !== hash(p.text)) {
+      out.push({ kind: "points", code: code2, key: p.key, text: `Points changed in ${code2}: ${p.key}` });
+    }
+  }
+  return out;
+}
+function boxChanges(before, boxes) {
+  const out = [];
+  for (const b of boxes) {
+    const was = own(before, b.key) ? before[b.key] : void 0;
+    if (!was) {
+      out.push({
+        kind: "box",
+        code: b.code,
+        key: b.key,
+        text: `New assignment box in ${b.code}: ${b.name}, deadline ${b.deadline || "none"}`
+      });
+    } else if (was.d !== b.deadline) {
+      out.push({
+        kind: "box",
+        code: b.code,
+        key: b.key,
+        text: `Assignment deadline changed in ${b.code}: ${b.name}, ${was.d || "none"} -> ${b.deadline || "none"}`
+      });
+    }
+  }
+  return out;
+}
+function changeLines(changes, max = 40) {
+  if (changes.length <= max) return changes.map((c) => c.text);
+  const lines = [];
+  const sums = /* @__PURE__ */ new Map();
+  const words = {
+    "file|new": "new files",
+    "file|replaced": "replaced files",
+    "file|gone": "files gone from IS",
+    points: "new or changed points rows",
+    box: "new or changed assignment boxes",
+    exam: "new exam terms",
+    ledger: "ledger entries to recheck"
+  };
+  for (const c of changes) {
+    if (c.kind === "subject") {
+      lines.push(c.text);
+      continue;
+    }
+    const w2 = c.kind === "file" ? `file|${c.what}` : c.kind;
+    const k = `${w2}|${c.code}`;
+    const cur2 = sums.get(k) ?? { n: 0, label: `${words[w2]} in ${c.code}` };
+    cur2.n++;
+    sums.set(k, cur2);
+  }
+  for (const { n, label: label2 } of sums.values()) lines.push(`${n} ${label2} (see the map below)`);
+  return lines;
+}
+function holdBack(prev, world, held) {
+  if (!held.length) return world;
+  const urls = /* @__PURE__ */ new Map();
+  for (const c of held) if (c.url) urls.set(c.code, (urls.get(c.code) ?? /* @__PURE__ */ new Set()).add(c.url));
+  const files2 = { ...world.files };
+  for (const [code2, hold] of urls) {
+    const before = prev?.files[code2];
+    files2[code2] = files2[code2]?.flatMap((f) => {
+      if (!hold.has(f.url)) return [f];
+      const was = own(before, f.url) ? before[f.url] : void 0;
+      return was ? [{ ...f, label: was.n, modified: was.m }] : [];
+    });
+  }
+  return { ...world, files: files2 };
+}
+const KINDS = [
+  "test",
+  "credit_test",
+  "defence",
+  "resit",
+  "programme_day",
+  "event",
+  "unregister_deadline",
+  "other"
+];
+const SOURCES = ["is", "course_file", "mail", "calendar", "student"];
+const ATTEND = ["test", "credit_test", "defence", "resit", "programme_day"];
+const MAX_ENTRIES = 200;
+const ID = /^ev-[0-9a-f]{12}$/;
+const DATE = /^\d{4}-\d{2}-\d{2}$/;
+const MAX_WINDOW_DAYS = 60;
+class LedgerInputError extends Error {
+}
+const bad = (m) => {
+  throw new LedgerInputError(m);
+};
+function isDay(s) {
+  if (typeof s !== "string" || !DATE.test(s)) return false;
+  const d = /* @__PURE__ */ new Date(`${s}T00:00:00Z`);
+  const y3 = d.getUTCFullYear();
+  return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s && y3 >= 2e3 && y3 <= 2100;
+}
+const dayNumber = (s) => Date.parse(`${s}T00:00:00Z`) / 864e5;
+function finish(f, meta) {
+  const need = (k, why) => f[k] ? f[k] : bad(`${k.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`)} is required${why}.`);
+  need("title", "");
+  const kind2 = f.kind ?? bad("kind is required.");
+  if (!isDay(f.date)) bad("date is required, as a real date written YYYY-MM-DD.");
+  const date2 = f.date;
+  if (f.until) {
+    const span = dayNumber(f.until) - dayNumber(date2);
+    if (span < 0) bad("until is before date.");
+    if (span > MAX_WINDOW_DAYS) bad(`A window can span at most ${MAX_WINDOW_DAYS} days.`);
+  }
+  const sourceKind = f.sourceKind ?? bad(`source_kind is required: ${SOURCES.join(", ")}.`);
+  if (sourceKind === "course_file") {
+    need("sourceUrl", " for a course file (pass the file's `url` from the overview)");
+    need("sourceModified", " for a course file (pass its `modified` from the overview)");
+  }
+  if (f.sourceUrl && sourceKind !== "course_file" && sourceKind !== "is")
+    bad("source_url is only for an event that comes from a course file in IS.");
+  const basis = f.basis ?? "stated";
+  if (basis === "inferred")
+    need("inferredHow", " when the date is inferred (say how it was worked out)");
+  else if (f.inferredHow) bad("inferred_how is only for an inferred date; set basis to inferred.");
+  const keep = (k) => f[k] === null || f[k] === void 0 ? {} : { [k]: f[k] };
+  return {
+    id: meta.id,
+    title: f.title,
+    kind: kind2,
+    ...keep("code"),
+    date: date2,
+    ...keep("time"),
+    ...keep("until"),
+    ...keep("lengthMinutes"),
+    ...keep("room"),
+    ...keep("points"),
+    ...keep("rule"),
+    ...keep("unregisterBy"),
+    ...keep("dependsOn"),
+    attendance: typeof f.attendance === "boolean" ? f.attendance : ATTEND.includes(kind2),
+    sourceKind,
+    ...keep("sourceFile"),
+    ...keep("sourceUrl"),
+    ...keep("sourceModified"),
+    basis,
+    ...keep("inferredHow"),
+    savedAt: meta.savedAt,
+    updatedAt: meta.updatedAt
+  };
+}
+const TIME = /^([01]\d|2[0-3]):[0-5]\d$/;
+const CODE = /^[\p{L}\p{N}][\p{L}\p{N}._-]{1,29}$/u;
+const CONTROL = /[\u0000-\u0008\u000b-\u001f\u007f]/;
+const TEXT_FIELDS = {
+  title: ["title", 120],
+  room: ["room", 60],
+  points: ["points", 40],
+  rule: ["rule", 500],
+  depends_on: ["dependsOn", 300],
+  source_file: ["sourceFile", 200],
+  source_url: ["sourceUrl", 600],
+  source_modified: ["sourceModified", 40],
+  inferred_how: ["inferredHow", 300]
+};
+function text(name2, v, max) {
+  if (v === void 0 || v === null) return void 0;
+  if (typeof v !== "string") return bad(`${name2} must be text.`);
+  const t = v.trim();
+  if (!t) return void 0;
+  if (CONTROL.test(t)) return bad(`${name2} contains a control character.`);
+  if (t.length > max)
+    return bad(`${name2} is ${t.length} characters; the most is ${max}. Shorten it.`);
+  return t;
+}
+function parseFields(args) {
+  const out = {};
+  const given = (k) => args[k] !== void 0;
+  for (const [name2, [key, max]] of Object.entries(TEXT_FIELDS)) {
+    if (given(name2)) out[key] = text(name2, args[name2], max) ?? null;
+  }
+  if (given("code")) {
+    const c = text("code", args.code, 30);
+    if (c && !CODE.test(c)) bad("code must be a subject code such as EBC-PE.");
+    out.code = c?.toUpperCase() ?? null;
+  }
+  for (const name2 of ["date", "until"]) {
+    if (!given(name2)) continue;
+    const v = text(name2, args[name2], 10) ?? null;
+    if (v !== null && !isDay(v))
+      bad(`${name2} must be a real date written YYYY-MM-DD (2000 to 2100).`);
+    out[name2] = v;
+  }
+  if (given("time")) {
+    const v = text("time", args.time, 5) ?? null;
+    if (v !== null && !TIME.test(v)) bad("time must be HH:MM, 24-hour, Prague time.");
+    out.time = v;
+  }
+  if (given("unregister_by")) {
+    const v = text("unregister_by", args.unregister_by, 16) ?? null;
+    if (v !== null && !(isDay(v) || isDay(v.slice(0, 10)) && TIME.test(v.slice(11)) && v[10] === " "))
+      bad("unregister_by must be YYYY-MM-DD or YYYY-MM-DD HH:MM.");
+    out.unregisterBy = v;
+  }
+  if (given("length_minutes")) {
+    const v = args.length_minutes;
+    if (v !== null && (typeof v !== "number" || !Number.isInteger(v) || v < 1 || v > 1440))
+      bad("length_minutes must be a whole number of minutes, 1 to 1440.");
+    out.lengthMinutes = v ?? null;
+  }
+  for (const [name2, list2] of [
+    ["kind", KINDS],
+    ["source_kind", SOURCES],
+    ["basis", ["stated", "inferred"]]
+  ]) {
+    if (!given(name2)) continue;
+    if (typeof args[name2] !== "string" || !list2.includes(args[name2]))
+      bad(`${name2} must be one of: ${list2.join(", ")}.`);
+    out[name2 === "source_kind" ? "sourceKind" : name2] = args[name2];
+  }
+  if (given("attendance")) {
+    if (typeof args.attendance !== "boolean") bad("attendance must be true or false.");
+    out.attendance = args.attendance;
+  }
+  return out;
+}
+function parseStored(raw) {
+  try {
+    const v = JSON.parse(raw ?? "null");
+    if (!v || typeof v !== "object" || Array.isArray(v) || !ID.test(String(v.id))) return null;
+    const snake = {
+      ...v,
+      depends_on: v.dependsOn,
+      length_minutes: v.lengthMinutes,
+      unregister_by: v.unregisterBy,
+      source_kind: v.sourceKind,
+      source_file: v.sourceFile,
+      source_url: v.sourceUrl,
+      source_modified: v.sourceModified,
+      inferred_how: v.inferredHow
+    };
+    const fields = parseFields(snake);
+    const at = (k) => typeof v[k] === "string" ? v[k] : "";
+    return finish(fields, {
+      id: v.id,
+      savedAt: at("savedAt"),
+      updatedAt: at("updatedAt")
+    });
+  } catch {
+    return null;
+  }
+}
+const pathOf = (id2) => `ledger/${id2}.json`;
+const FILE = /^ledger\/(ev-[0-9a-f]{12})\.json$/;
+const KEEP_PAST_DAYS = 30;
+const byDate = (a, b) => `${a.date} ${a.time ?? "00:00"} ${a.id}`.localeCompare(`${b.date} ${b.time ?? "00:00"} ${b.id}`);
+const titleKey = (t) => t.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/\s+/g, " ").trim();
+const sameEvent = (e) => [e.code ?? "", e.kind, e.date, e.time ?? "", e.sourceUrl ?? "", titleKey(e.title)].join("|");
+const queues$2 = /* @__PURE__ */ new WeakMap();
+function createLedger(store2, now = Date.now, max = MAX_ENTRIES) {
+  const serial = (fn) => {
+    const run = (queues$2.get(store2) ?? Promise.resolve()).then(
+      () => store2.exclusive("ledger", fn),
+      () => store2.exclusive("ledger", fn)
+    );
+    queues$2.set(
+      store2,
+      run.catch(() => {
+      })
+    );
+    return run;
+  };
+  async function list2() {
+    const ids = (await store2.listFolder("ledger")).flatMap((e) => FILE.exec(e.path)?.[1] ?? []);
+    const read = await Promise.all(
+      ids.map(async (id2) => parseStored(await store2.readText(pathOf(id2))))
+    );
+    const entries2 = read.filter((e) => !!e && ID.test(e.id)).sort(byDate);
+    return { entries: entries2, unreadable: read.length - entries2.length };
+  }
+  async function put(entry, gen) {
+    const kept = await store2.write(pathOf(entry.id), JSON.stringify(entry), { after: gen });
+    if (!kept)
+      throw new Error(
+        "The entry was not saved: reIS’s folder is full, or everything was forgotten while this ran. Try again."
+      );
+  }
+  async function prune(entries2, today) {
+    const limit2 = dayNumber(today) - KEEP_PAST_DAYS;
+    const old = entries2.filter((e) => dayNumber(e.until ?? e.date) < limit2);
+    await Promise.all(old.map((e) => store2.remove(pathOf(e.id))));
+    return entries2.filter((e) => !old.includes(e));
+  }
+  const stamp = () => new Date(now()).toISOString();
+  const askedUnder = () => store2.generation().catch(() => null);
+  return {
+    list: list2,
+    askedUnder,
+    /** Saves a new event, or updates the one already saved for the same subject, kind, day, time, file and title. */
+    /** `asked`: the forget token taken when the tool call began (askedUnder), if it began earlier. */
+    add: (args, today, asked = askedUnder()) => serial(async () => {
+      const gen = await asked;
+      const fields = parseFields(args);
+      const { entries: entries2 } = await list2();
+      const probe = finish(fields, { id: "ev-000000000000", savedAt: "", updatedAt: "" });
+      const twin = entries2.find((e) => sameEvent(e) === sameEvent(probe));
+      if (twin) return { entry: await merge2(twin, fields, gen), created: false };
+      const live = entries2.length >= max ? await prune(entries2, today) : entries2;
+      if (live.length >= max)
+        throw new LedgerInputError(
+          `The ledger holds ${max} events, its limit. Remove finished or wrong ones with action "remove" first.`
+        );
+      const at = stamp();
+      const entry = finish(fields, {
+        id: `ev-${randomBytes(6).toString("hex")}`,
+        savedAt: at,
+        updatedAt: at
+      });
+      await put(entry, gen);
+      return { entry, created: true };
+    }),
+    /** Changes the fields given; an empty string clears one. The id and the saved date stay. */
+    update: (id2, args, asked = askedUnder()) => serial(async () => {
+      const gen = await asked;
+      if (!ID.test(id2))
+        throw new LedgerInputError("id must be an event id such as ev-0123456789ab.");
+      const old = parseStored(await store2.readText(pathOf(id2)));
+      if (!old)
+        throw new LedgerInputError(`No ledger entry ${id2}. Use action "list" to see the ids.`);
+      return merge2(old, parseFields(args), gen);
+    }),
+    /** True if there was such an entry. */
+    remove: (id2) => serial(async () => {
+      if (!ID.test(id2))
+        throw new LedgerInputError("id must be an event id such as ev-0123456789ab.");
+      const had = !!await store2.read(pathOf(id2));
+      await store2.remove(pathOf(id2));
+      return had;
+    })
+  };
+  async function merge2(old, patch, gen) {
+    const next = { ...old };
+    for (const [k, v] of Object.entries(patch)) next[k] = v;
+    if (patch.basis === "stated" && patch.inferredHow === void 0) delete next.inferredHow;
+    const entry = finish(next, { id: old.id, savedAt: old.savedAt, updatedAt: stamp() });
+    await put(entry, gen);
+    return entry;
+  }
+}
+function ledgerChanges(entries2, changes) {
+  const out = [];
+  for (const c of changes) {
+    const url2 = c.what === "replaced" ? c.url : c.what === "gone" ? c.was : void 0;
+    if (c.kind !== "file" || !url2) continue;
+    const hit = entries2.filter((e) => e.sourceUrl === url2);
+    if (!hit.length) continue;
+    const verb = c.what === "gone" ? "is gone from IS" : "was replaced";
+    out.push({
+      kind: "ledger",
+      code: c.code,
+      text: `Recheck ${hit.length} ledger ${hit.length === 1 ? "entry" : "entries"} in ${c.code}: their source file ${verb} (${hit.slice(0, 5).map((e) => `${e.id} ${e.title}`).join("; ")}${hit.length > 5 ? `; and ${hit.length - 5} more` : ""})`
+    });
+  }
+  return out;
+}
+const isToken = (t) => !!t && typeof t === "object" && "gen" in t && "at" in t;
+async function readRecord(store2, path2, fallback) {
+  const own2 = parseSnapshot(await store2.readText(path2));
+  if (own2 || !fallback) return { prev: own2, borrowed: false };
+  const other = parseSnapshot(await store2.readText(fallback));
+  return { prev: other, borrowed: !!other };
+}
+async function look(store2, run, ctx, now, prev) {
+  const g2 = await gather(run, ctx, now);
+  if (!g2.subjects.length && prev && Object.keys(prev.subjects).length) {
+    throw new Error("IS Mendelu returned no subjects this time. Try again in a minute.");
+  }
+  for (const [code2, rows2] of Object.entries(g2.world.points)) {
+    if (rows2 && !rows2.length && Object.keys(prev?.points[code2] ?? {}).length) {
+      delete g2.world.points[code2];
+      g2.problems.push(
+        `points of ${code2}: IS returned none this time, so the earlier record is kept`
+      );
+    }
+  }
+  const { entries: ledger } = await createLedger(store2).list();
+  const diffed = prev ? diffWorld(prev, g2.world) : [];
+  return { prev, g: g2, ledger, changes: [...diffed, ...ledgerChanges(ledger, diffed)] };
+}
+async function recordLook(store2, path2, prev, world, held, token, opts = {}) {
+  const latest = parseSnapshot(await store2.readText(path2)) ?? prev;
+  const snap = snapshotOf(holdBack(prev, world, held), latest);
+  opts.patch?.(snap);
+  const next = { ...snap, ...opts.extra };
+  return store2.write(path2, JSON.stringify(next), isToken(token) ? { after: token.gen } : {}).catch(() => false);
+}
+const FORMS = {
+  P: "P (prezenční, full-time)",
+  K: "K (kombinované, combined)"
+};
+const deadlineKey = (d) => {
+  const m = /(\d{1,2})\.\s*(\d{1,2})\.\s*(\d{4})(?:\s+(\d{1,2}):(\d{2}))?/.exec(d);
+  return m ? `${m[3]}${m[2].padStart(2, "0")}${m[1].padStart(2, "0")}${(m[4] ?? "0").padStart(2, "0")}${m[5] ?? "00"}` : "9";
+};
+function student(profile) {
+  if (!profile) return void 0;
+  const form = typeof profile.studyForm === "string" ? profile.studyForm : "";
+  return {
+    programme: profile.studyProgram,
+    form: form ? FORMS[form] ?? form : void 0,
+    year: profile.studyYear,
+    semester: profile.studySemester,
+    faculty: profile.facultyLabel,
+    period: profile.periodLabel
+  };
+}
+function fileRows(files2, marks, saved, localPath) {
+  return files2.map((f) => {
+    const label2 = labelOf$1(f);
+    return {
+      file: label2,
+      // The document's own title, only when it says more than the file's name.
+      ...f.name && f.name !== label2.replace(/\.[^.]+$/, "") ? { title: f.name } : {},
+      modified: modifiedOf(f),
+      ...saved(f) ? { textSaved: "yes" } : {},
+      ...localPath?.(f) ? { localPath: localPath(f) } : {},
+      ...marks.has(f.downloadUrl) ? { changed: marks.get(f.downloadUrl) } : {},
+      url: f.downloadUrl
+    };
+  });
+}
+const SHOWN_TERMS = 6;
+function shownExams(rows2) {
+  const terms = /* @__PURE__ */ new Map();
+  let hidden = 0;
+  const exams = rows2.filter((e) => {
+    if (e.state === "registered") return true;
+    const k = `${e.code}|${e.section}`;
+    const n = (terms.get(k) ?? 0) + 1;
+    terms.set(k, n);
+    if (n <= SHOWN_TERMS) return true;
+    hidden++;
+    return false;
+  }).map(({ code: code2, section, state: state2, date: date2, time: time2, room }) => ({
+    code: code2,
+    section,
+    state: state2,
+    date: date2,
+    time: time2,
+    room
+  }));
+  return { exams, hidden };
+}
+const listedDate = (f) => f.modified || f.date || "";
+const squash = (s) => s.replace(/\s+/g, "").toLowerCase();
+function recheckReason(e, listings) {
+  if (!e.sourceUrl) return void 0;
+  const lists = Object.values(listings).filter((l) => !!l);
+  const file = lists.flat().find((f) => f.downloadUrl === e.sourceUrl);
+  if (file) {
+    const now = listedDate(file);
+    if (!e.sourceModified || !now || squash(now) === squash(e.sourceModified)) return void 0;
+    return `its source file was replaced in IS (modified ${e.sourceModified}, now ${now}): read it again and update or remove this entry`;
+  }
+  if (e.code && listings[e.code]) {
+    return "its source file is no longer listed in IS: check the date another way, then update or remove this entry";
+  }
+  return void 0;
+}
+async function storedListings(store2) {
+  const out = {};
+  const paths = (await store2.list()).map((e) => e.path).filter((p) => /^listings\/[^/]+\.json$/.test(p));
+  for (const p of paths) {
+    try {
+      const rec = JSON.parse(await store2.readText(p) ?? "null");
+      if (typeof rec?.code !== "string" || !Array.isArray(rec.files)) continue;
+      out[rec.code] = rec.files.filter(
+        (f) => f && typeof f === "object" && typeof f.downloadUrl === "string"
+      );
+    } catch {
+    }
+  }
+  return out;
+}
+function findListed(listings, url2) {
+  return Object.values(listings).flatMap((l) => l ?? []).find((f) => f.downloadUrl === url2);
+}
+async function readVersion(store2, url2) {
+  const head = await store2.readHead(textPath(url2), 2048) ?? "";
+  const m = /"stamp":("(?:[^"\\]|\\.)*")/.exec(head);
+  try {
+    const stamp = m ? JSON.parse(m[1]) : "";
+    return /^(?:modified|date)\s+(.+)$/.exec(stamp)?.[1]?.trim() || void 0;
+  } catch {
+    return void 0;
+  }
+}
+const isDate = (iso) => `${Number(iso.slice(8))}.${Number(iso.slice(5, 7))}.${iso.slice(0, 4)}`;
+function daysLeftOf(e, now) {
+  const today = pragueToday(now.getTime()) / DAY;
+  const day2 = (iso) => Date.parse(`${iso}T00:00:00Z`) / DAY;
+  return { start: day2(e.date) - today, end: day2(e.until ?? e.date) - today };
+}
+function whenOf(e) {
+  if (e.until && e.until !== e.date)
+    return `${isDate(e.date)}${e.time ? ` ${e.time}` : ""} – ${isDate(e.until)}`;
+  return `${isDate(e.date)}${e.time ? ` ${e.time}` : ""}`;
+}
+const confirmNote = (e) => e.basis === "inferred" ? `Date inferred, not stated: ${e.inferredHow}. Confirm with the teacher.` : void 0;
+function ledgerItems(entries2, now, listings) {
+  const rows2 = [];
+  for (const e of entries2) {
+    const { start: start2, end: end2 } = daysLeftOf(e, now);
+    if (end2 < 0) continue;
+    const starts = parsePrague(isDate(e.date), e.time ?? "00:00");
+    if (!starts) continue;
+    const recheck = recheckReason(e, listings);
+    const confirm = confirmNote(e);
+    rows2.push({
+      // A window already under way sorts as of today, so it is not buried behind its start.
+      at: start2 < 0 ? now.getTime() : starts.at,
+      timed: !!e.time && start2 >= 0,
+      item: {
+        id: e.id,
+        when: whenOf(e),
+        daysLeft: Math.max(0, start2),
+        kind: e.kind,
+        code: e.code ?? "",
+        title: e.title,
+        attendance: e.attendance ? "yes" : "",
+        source: "ledger",
+        basis: e.basis,
+        ...e.room ? { room: e.room } : {},
+        ...e.unregisterBy ? { unregisterBy: e.unregisterBy } : {},
+        ...recheck ? { recheck } : {},
+        ...confirm ? { confirm } : {}
+      }
+    });
+  }
+  return rows2;
+}
+const MAX_SHOWN = 20;
+const SOON_DAYS = 14;
+function upcomingItems(boxes, exams, now, ledger, limit2 = MAX_SHOWN) {
+  const today = pragueToday(now.getTime());
+  const all = [];
+  const add = (when, item) => {
+    if (!when || when.at < now.getTime()) return;
+    all.push({ at: when.at, item: { ...item, daysLeft: Math.round((when.day - today) / DAY) } });
+  };
+  for (const e of exams ?? []) {
+    if (e.state !== "registered") continue;
+    add(parsePrague(e.date, e.time), {
+      when: `${e.date} ${e.time}`.trim(),
+      kind: "exam",
+      code: e.code,
+      title: `${e.section}${e.room ? `, ${e.room}` : ""}`,
+      attendance: "yes",
+      source: "is-exam"
+    });
+  }
+  for (const b of boxes ?? []) {
+    if (!b.open || b.submission === "handed_in") continue;
+    add(parsePrague(b.deadline), {
+      when: b.deadline,
+      kind: "assignment",
+      code: b.code,
+      title: b.name,
+      attendance: "",
+      source: "is-assignment"
+    });
+  }
+  if (ledger) {
+    const isTerms = new Set(
+      all.filter((a) => a.item.source === "is-exam").map((a) => `${a.item.code}|${a.at}`)
+    );
+    for (const l of ledgerItems(ledger.entries, now, ledger.listings)) {
+      if (l.timed && isTerms.has(`${l.item.code}|${l.at}`)) continue;
+      all.push({ at: l.at, item: l.item });
+    }
+  }
+  const sorted = all.sort((a, b) => a.at - b.at).map(
+    (x3) => x3.item.daysLeft <= SOON_DAYS ? { ...x3.item, inNext14Days: "yes" } : x3.item
+  );
+  return { items: sorted.slice(0, limit2), more: Math.max(0, sorted.length - limit2) };
+}
+const CAPS = [Infinity, 30, 20, 12, 8, 5, 3, 1, 0];
+function build$1(input, whole, marks, keep = Infinity) {
+  const { g: g2 } = input;
+  const subjects = g2.subjects.map((s) => {
+    const files2 = g2.listings[s.code];
+    const points2 = g2.world.points[s.code];
+    let shown2;
+    let more;
+    if (files2) {
+      const rows2 = fileRows(files2, marks, input.saved, input.localPath);
+      if (whole(s.code, rows2.length)) shown2 = rows2;
+      else {
+        const saved = rows2.filter((r2) => !r2.changed && (r2.textSaved || r2.localPath));
+        const kept = /* @__PURE__ */ new Set([
+          ...rows2.filter((r2) => r2.changed),
+          ...saved.slice(0, Math.max(0, keep - rows2.filter((r2) => r2.changed).length))
+        ]);
+        shown2 = rows2.filter((r2) => kept.has(r2));
+        more = `${files2.length} files in all (${shown2.length} shown): call mendelu_subject_files with code ${s.code} for the full list`;
+      }
+    }
+    return {
+      code: s.code,
+      name: s.name,
+      subjectId: s.subjectId,
+      points: points2 ? points2.length ? points2.map((p) => p.key.startsWith("test /") ? p.text : `${p.key}: ${p.text}`) : "none in IS yet" : "could not be read (see problems)",
+      files: shown2,
+      moreFiles: more,
+      ...files2 ? {} : { filesNote: "could not be read (see problems)" }
+    };
+  });
+  const open2 = (g2.boxes ?? []).filter((b) => b.open).sort((a, b) => deadlineKey(a.deadline).localeCompare(deadlineKey(b.deadline))).map((b) => ({
+    code: b.code,
+    name: b.name,
+    deadline: b.deadline,
+    state: b.submission,
+    points: b.points
+  }));
+  const closed = (g2.boxes ?? []).length - open2.length;
+  const anyPath = subjects.some((s) => s.files?.some((r2) => r2.localPath));
+  const listed = open2.slice(0, input.assignments ?? open2.length);
+  const { exams, hidden } = shownExams(g2.exams ?? []);
+  const upcoming = upcomingItems(
+    g2.boxes,
+    g2.exams,
+    input.now ?? /* @__PURE__ */ new Date(),
+    input.ledger?.length ? { entries: input.ledger, listings: g2.listings } : void 0,
+    input.upcomingShown
+  );
+  const lines = input.first ? [] : changeLines(input.changes);
+  const note = input.first ? 'First overview on this computer, so this is the whole map and there is nothing to compare it with. From the next call on, "changed" lists what is new since this one.' : lines.length ? `${input.changes.length} change(s) in IS since the last overview. They are listed once under "changed" and will not be repeated.` : "Nothing changed in IS since the last overview.";
+  const noted = input.omitted ? `${note} ${input.omitted} more changed file(s) do not fit in this answer: they come with the next call to mendelu_overview.` : note;
+  return {
+    note: noted,
+    changed: lines.length ? lines : void 0,
+    problems: g2.problems.length ? g2.problems : void 0,
+    student: student(input.profile),
+    savedFiles: anyPath && input.folder ? `Each file with a localPath is saved on this computer: its full path is ${input.folder} joined with its localPath.` : void 0,
+    upcoming: upcoming.items.length ? upcoming.items : void 0,
+    moreUpcoming: upcoming.more ? `${upcoming.more} more, later: see openAssignments, exams and mendelu_ledger (action list)` : void 0,
+    subjects,
+    openAssignments: listed.length ? listed : void 0,
+    moreAssignments: listed.length < open2.length ? `${open2.length - listed.length} more open: call mendelu_assignments` : void 0,
+    closedAssignments: closed > 0 ? `${closed} closed (call mendelu_assignments to see them)` : void 0,
+    exams: exams.length ? exams : void 0,
+    moreExamTerms: hidden ? `${hidden} more open terms: call mendelu_exams` : void 0,
+    nextSevenDays: g2.week?.length ? g2.week : g2.week ? "no lessons" : void 0
+  };
+}
+const sizeOf$1 = (o, format2) => format2 === "json" ? JSON.stringify(o, null, 2).length : toMarkdown(o).length;
+const marksOf = (changes) => new Map(changes.flatMap((c) => c.url && c.what ? [[c.url, c.what]] : []));
+function fitOverview(input) {
+  const marks = marksOf(input.changes);
+  const small = (o) => sizeOf$1(o, input.format) <= CHARACTER_LIMIT - 300;
+  const fits = (whole2, keep) => {
+    const out = build$1(input, whole2, marks, keep);
+    return small(out) ? out : null;
+  };
+  const cap = CAPS.find((c) => fits((_, n) => n <= c, c)) ?? 0;
+  const expanded = /* @__PURE__ */ new Set();
+  const whole = (code2, n) => n <= cap || expanded.has(code2);
+  const left = Object.entries(input.g.listings).filter(([, f]) => f && f.length > cap).sort((a, b) => a[1].length - b[1].length);
+  for (const [code2] of left) {
+    expanded.add(code2);
+    if (!fits(whole, cap)) expanded.delete(code2);
+  }
+  const best = fits(whole, cap);
+  if (best) return { out: best, held: [] };
+  const rowed = input.changes.filter((c) => c.url && c.what);
+  const isRowed = new Set(rowed);
+  const lean = (k, bound2) => {
+    const kept = new Set(rowed.slice(0, k));
+    const changes = input.changes.filter((c) => !isRowed.has(c) || kept.has(c));
+    const omitted = rowed.length - k;
+    const out = build$1(
+      { ...input, changes, saved: () => false, localPath: void 0, omitted, ...bound2 },
+      (_, n) => n <= 0,
+      marksOf(changes)
+    );
+    return { out, held: rowed.slice(k) };
+  };
+  const steps = [
+    ...[Infinity, 20, 10, 5, 3, 1, 0].map((assignments) => ({ assignments })),
+    ...[10, 5, 3, 1, 0].map((upcomingShown) => ({ assignments: 0, upcomingShown }))
+  ];
+  const bound = steps.find((b) => small(lean(0, b).out)) ?? steps[steps.length - 1];
+  let [lo, hi] = [0, rowed.length];
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (small(lean(mid, bound).out)) lo = mid;
+    else hi = mid - 1;
+  }
+  return lean(lo, bound);
+}
+const OVERVIEW_TOOL = {
+  name: "mendelu_overview",
+  title: "Overview of my school situation, and what changed",
+  description: 'START HERE. Call this FIRST, before any other mendelu_ tool, for any question about the student\'s school situation: how they are doing, their points, what is due, exams, the timetable, what is new, or where something is. One call returns: (1) "changed": what is new in IS since the last time it was called (new, replaced or removed course files, new or changed points, new assignment boxes or deadlines, new exam terms, new subjects), each shown ONCE; (2) the student\'s study programme and form; (3) every enrolled subject with the student\'s points in it and its course files (name, date modified, a `url` to give to mendelu_read_file, `textSaved: yes` when that file\'s text is already kept on this computer, and `localPath` when the original file itself is saved: it is relative to the folder named in `savedFiles`, so you can open it with your own file tools instead of downloading it; mendelu_build_my_map saves them all); (4) "upcoming": what is coming, soonest first, with days left, `attendance: yes` for events the student must attend in person, and `inNext14Days`: the registered exam and credit terms and assignment deadlines from IS, plus every event saved in the ledger (`source: ledger`, with its `id`; `basis: inferred` dates carry a `confirm` note, and `recheck` means the file the date came from changed: read it again and fix the entry); tell the student about anything within a week, and about every `recheck` and `confirm`. When you read a course file, conditions, harmonogram or mail that names a date the student must attend or act on, SAVE it with mendelu_ledger before answering; (5) the open assignments with deadlines, the exam terms and the lessons of the next 7 days. It downloads no file and changes nothing in IS. IMPORTANT: many answers are only inside a course file, not in IS\'s exam list or timetable: a credit-test date, test topics, passing conditions, a reference sheet, a project brief usually sit in a file such as a course schedule ("harmonogram") or conditions PDF. When a question is about such a thing, open the likely files from this map with mendelu_read_file (pass the file\'s `url`) BEFORE saying IS has no answer, and say which file the answer came from. If a subject\'s file list is cut ("N files in all"), call mendelu_subject_files with that code. When the answer depends on the student\'s study form (P = full-time, K = combined), use `student.form` rather than guessing. A subject with no points listed has none in IS yet. If the first line says this is the first overview, there is nothing to compare yet. Pass "json" as response_format only if you need raw data.'
+};
+const RECORD = "overview/seen.json";
+const queues$1 = /* @__PURE__ */ new WeakMap();
+function runOverview(d) {
+  const prior = queues$1.get(d.store) ?? Promise.resolve();
+  const run = prior.then(
+    () => overview(d),
+    () => overview(d)
+  );
+  queues$1.set(
+    d.store,
+    run.catch(() => {
+    })
+  );
+  return run;
+}
+async function overview(d) {
+  const { prev } = await readRecord(d.store, RECORD);
+  const { g: g2, ledger, changes } = await look(d.store, d.run, d.ctx, d.now ?? /* @__PURE__ */ new Date(), prev);
+  await d.settled();
+  let profile = null;
+  try {
+    const p = JSON.parse(await d.store.readText("profile.json") ?? "null");
+    profile = p && typeof p === "object" ? p : null;
+  } catch {
+    profile = null;
+  }
+  const saved = await savedFiles(d, g2.listings);
+  const localPath = await savedOriginals(d, g2.listings);
+  const { out, held } = fitOverview({
+    g: g2,
+    first: !prev,
+    changes,
+    profile,
+    saved,
+    localPath,
+    folder: d.store.dir,
+    ledger,
+    format: d.format,
+    now: d.now
+  });
+  await recordLook(d.store, RECORD, prev, g2.world, held, d.token);
+  return out;
+}
+async function savedFiles(d, listings) {
+  const stored = new Set((await d.store.list()).map((e) => e.path));
+  const kept = /* @__PURE__ */ new Set();
+  for (const f of Object.values(listings).flatMap((l) => l ?? [])) {
+    const path2 = textPath(f.downloadUrl);
+    if (!f.modified || !stored.has(path2)) continue;
+    if (await textIsKept(
+      d.store,
+      path2,
+      f.downloadUrl,
+      `modified ${f.modified}`,
+      d.extractsText !== false
+    )) {
+      kept.add(f.downloadUrl);
+    }
+  }
+  return (f) => kept.has(f.downloadUrl);
+}
+async function savedOriginals(d, listings) {
+  const stored = new Set((await d.store.list()).map((e) => e.path));
+  const originals = createOriginals(d.store);
+  const paths = /* @__PURE__ */ new Map();
+  for (const f of Object.values(listings).flatMap((l) => l ?? [])) {
+    if (!f.modified || !stored.has(metaPath(f.downloadUrl))) continue;
+    const rel = await originals.kept(f.downloadUrl, stampOf(f));
+    if (rel) paths.set(f.downloadUrl, rel);
+  }
+  return (f) => paths.get(f.downloadUrl);
+}
+const FORGET_TOOL = {
+  name: "mendelu_forget_everything",
+  title: "Forget everything reIS saved",
+  description: "Deletes everything reIS for Claude has saved on this computer: the subject list, folder listings, the text of every file read, the original course files saved by mendelu_read_file and mendelu_build_my_map, the study profile, the record of what the overview already reported and the list of upcoming events kept with mendelu_ledger, and empties its memory of this session. It changes nothing in IS Mendelu and nothing in any calendar, and it cannot remove what is already in a Claude conversation. Call it ONLY when the student explicitly asks to forget or delete what reIS saved; never as a fix for another problem. Reports what it removed."
+};
+const GB$1 = 1024 ** 3;
+const MB$2 = 1024 ** 2;
+const size$2 = (b) => b >= GB$1 ? `${(b / GB$1).toFixed(1)} GB` : `${(b / MB$2).toFixed(1)} MB`;
+const shown = (dir, home = homedir()) => dir.startsWith(home) ? `~${dir.slice(home.length)}` : dir;
+async function forgetEverything(store2, clearMemory) {
+  clearMemory();
+  let removed;
+  try {
+    removed = await store2.forget();
+  } catch (e) {
+    if (store2.persistent)
+      throw new Error(
+        `Could not delete everything in ${shown(store2.dir)}. Some saved files may remain: close any program that has files there open and try again, or delete the folder yourself.`
+      );
+    return {
+      forgotten: false,
+      folder: shown(store2.dir),
+      note: `Memory is cleared, but reIS could not reach its folder this session (${e.code ?? "unknown error"}), so saved files there may remain. Delete the folder yourself.`
+    };
+  }
+  return {
+    forgotten: true,
+    folder: shown(store2.dir),
+    filesRemoved: removed.files,
+    removed: size$2(removed.bytes),
+    note: "Deleted what reIS had saved on this computer and cleared this session’s memory. Nothing was changed in IS Mendelu, and anything already shared in a Claude conversation stays there."
+  };
+}
+const MARKS = new RegExp("\\p{M}", "gu");
+const foldPlain = (s) => (
+  // ς (word-final sigma) is σ: lower-casing a whole string and a single letter disagree on it.
+  s.normalize("NFKD").replace(MARKS, "").toLowerCase().replace(/ς/g, "σ")
+);
+const ASCII = /^[\x00-\x7f]*$/;
+function foldMapped(s) {
+  if (ASCII.test(s)) return { text: s.toLowerCase(), origin: (i) => Math.min(i, s.length) };
+  const parts2 = [];
+  const starts = [];
+  const cache2 = /* @__PURE__ */ new Map();
+  for (let i = 0; i < s.length; ) {
+    const cp = s.codePointAt(i);
+    const len = cp > 65535 ? 2 : 1;
+    let f;
+    if (cp < 128) f = String.fromCharCode(cp).toLowerCase();
+    else {
+      const ch = s.slice(i, i + len);
+      f = cache2.get(ch) ?? foldPlain(ch);
+      cache2.set(ch, f);
+    }
+    if (f) {
+      parts2.push(f);
+      for (let k = 0; k < f.length; k++) starts.push(i);
+    }
+    i += len;
+  }
+  return { text: parts2.join(""), origin: (i) => i >= starts.length ? s.length : starts[i] };
+}
+const MAX_TERMS = 12;
+const MAX_TERM = 120;
+function parseQuery(raw) {
+  const found = [];
+  for (const m of raw.matchAll(/"([^"]*)"|“([^”]*)”|„([^“”"]*)[“”"]|(\S+)/g)) {
+    const t = (m[1] ?? m[2] ?? m[3] ?? (m[4] ?? "").replace(/["“”„]/g, "")).trim().replace(/\s+/g, " ");
+    if (t && /[\p{L}\p{N}]/u.test(t)) found.push(t.slice(0, MAX_TERM));
+  }
+  const seen = /* @__PURE__ */ new Set();
+  const display = [];
+  const terms = [];
+  for (const t of found) {
+    const f = foldPlain(t);
+    if (seen.has(f)) continue;
+    seen.add(f);
+    display.push(t);
+    terms.push(f);
+  }
+  return { terms: terms.slice(0, MAX_TERMS), display: display.slice(0, MAX_TERMS) };
+}
+function termRegex(term) {
+  const body2 = term.split(" ").map((w2) => w2.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("\\s+");
+  return new RegExp(body2, "g");
+}
+function countMatches(folded, re, cap = 1e3) {
+  re.lastIndex = 0;
+  let n = 0;
+  while (n < cap && re.exec(folded)) {
+    n++;
+    if (re.lastIndex === 0) break;
+  }
+  return n;
+}
+const SIDE = 200;
+const MAX_SPAN = 600;
+const MAX_POSITIONS = 1e5;
+function rangesOf(folded, term) {
+  const re = termRegex(term);
+  const out = [];
+  for (let m = re.exec(folded); m && out.length < MAX_POSITIONS; m = re.exec(folded)) {
+    out.push([m.index, m.index + m[0].length]);
+    if (m[0].length === 0) re.lastIndex++;
+  }
+  return out;
+}
+function tightest(lists) {
+  const present = lists.filter((l) => l.length);
+  if (!present.length) return null;
+  const [anchor2, ...rest] = [...present].sort((a, b) => a.length - b.length);
+  let best = null;
+  for (const [s, e] of anchor2) {
+    let from = s;
+    let to = e;
+    for (const list2 of rest) {
+      let lo = 0;
+      let hi = list2.length - 1;
+      while (lo < hi) {
+        const mid = lo + hi >> 1;
+        if (list2[mid][0] < s) lo = mid + 1;
+        else hi = mid;
+      }
+      const near = [list2[lo], list2[lo - 1]].filter((r2) => !!r2);
+      const pick2 = near.sort((a, b) => Math.abs(a[0] - s) - Math.abs(b[0] - s))[0];
+      from = Math.min(from, pick2[0]);
+      to = Math.max(to, pick2[1]);
+    }
+    if (!best || to - from < best[1] - best[0]) best = [from, to];
+  }
+  return best;
+}
+function spanOf(folded, terms) {
+  const lists = terms.map((t) => rangesOf(folded, t));
+  if (lists.some((l) => !l.length)) return null;
+  const w2 = tightest(lists);
+  return w2 ? w2[1] - w2[0] : null;
+}
+function prepareSnippet(text2, terms) {
+  const f = foldMapped(text2);
+  const lists = terms.map((t) => rangesOf(f.text, t));
+  const present = lists.filter((l) => l.length).length;
+  let window2 = tightest(lists);
+  if (!window2) return null;
+  let together = present === terms.length;
+  if (window2[1] - window2[0] > MAX_SPAN) {
+    const rarest = lists.filter((l) => l.length).sort((a, b) => a.length - b.length)[0];
+    window2 = rarest[0];
+    together = false;
+  }
+  const found = window2;
+  return (side) => cut(text2, f, lists, found, together, side);
+}
+function cut(text2, f, lists, window2, together, side) {
+  const from = f.origin(window2[0]);
+  const to = Math.max(f.origin(window2[1]), from);
+  let start2 = Math.max(0, from - side);
+  let end2 = Math.min(text2.length, to + side);
+  while (start2 > 0 && start2 < from && !/\s/.test(text2[start2 - 1])) start2++;
+  while (end2 < text2.length && end2 > to && !/\s/.test(text2[end2])) end2--;
+  const marks = lists.flat().map(([a, b]) => {
+    const from2 = f.origin(a);
+    let to2 = Math.max(f.origin(b), from2 + 1);
+    if (/[\ud800-\udbff]/.test(text2[to2 - 1] ?? "")) to2++;
+    return [from2, to2];
+  }).filter(([a, b]) => a >= start2 && b <= end2).sort((a, b) => a[0] - b[0]);
+  let out = "";
+  let at = start2;
+  for (const [a, b] of marks) {
+    if (a < at) continue;
+    out += text2.slice(at, a) + "**" + text2.slice(a, b) + "**";
+    at = b;
+  }
+  out += text2.slice(at, end2);
+  const snippet = `${start2 > 0 ? "… " : ""}${out.replace(/\s+/g, " ").trim()}${end2 < text2.length ? " …" : ""}`;
+  const before = text2.slice(0, from);
+  const hasPages = text2.includes("\f");
+  const count = (c) => before.split(c).length;
+  return {
+    snippet,
+    together,
+    ...hasPages ? { page: count("\f") } : { line: count("\n") }
+  };
+}
+const isObject = (v) => !!v && typeof v === "object" && !Array.isArray(v);
+const str = (v) => typeof v === "string" && v ? v : void 0;
+async function readJson(store2, path2) {
+  try {
+    const v = JSON.parse(await store2.readText(path2) ?? "null");
+    return isObject(v) ? v : void 0;
+  } catch {
+    return void 0;
+  }
+}
+const subjectNameOf = (s) => str(s.nameCs) ?? str(s.fullName) ?? str(s.displayName) ?? str(s.name);
+async function loadDocs(store2) {
+  const paths = (await store2.list()).map((e) => e.path);
+  const names2 = /* @__PURE__ */ new Map();
+  const subjects = await readJson(store2, "subjects.json");
+  const list2 = Array.isArray(subjects?.subjects) ? subjects.subjects : [];
+  for (const s of list2) {
+    if (!isObject(s)) continue;
+    const code2 = str(s.subjectCode) ?? str(s.code);
+    const name2 = subjectNameOf(s);
+    if (code2 && name2) names2.set(code2, name2);
+  }
+  const byUrl = /* @__PURE__ */ new Map();
+  const listings = paths.filter((p) => /^listings\/[^/]+\.json$/.test(p));
+  for (const rec of await Promise.all(listings.map((p) => readJson(store2, p)))) {
+    const code2 = str(rec?.code);
+    if (!code2 || !Array.isArray(rec?.files)) continue;
+    for (const f of rec.files) {
+      if (!isObject(f) || !str(f.downloadUrl)) continue;
+      const url2 = f.downloadUrl;
+      byUrl.set(url2, {
+        url: url2,
+        code: code2,
+        ...names2.has(code2) ? { subjectName: names2.get(code2) } : {},
+        title: str(f.name),
+        file: str(f.file),
+        folder: str(f.folder),
+        modified: str(f.modified),
+        date: str(f.date),
+        listedStamp: stampOf(f)
+      });
+    }
+  }
+  const texts = paths.filter((p) => /^text\/[^/]+\.json$/.test(p));
+  for (let i = 0; i < texts.length; i += 8) {
+    const batch = texts.slice(i, i + 8);
+    const recs = await Promise.all(batch.map((p) => readJson(store2, p)));
+    recs.forEach((rec, k) => {
+      const url2 = str(rec?.url);
+      const file = rec?.file;
+      if (!url2 || !isObject(file)) return;
+      const doc = byUrl.get(url2) ?? { url: url2, file: str(file.filename) };
+      doc.textPath = batch[k];
+      doc.readStamp = str(rec?.stamp);
+      if (typeof file.text === "string" && file.text.trim()) doc.text = file.text;
+      byUrl.set(url2, doc);
+    });
+  }
+  return { docs: [...byUrl.values()] };
+}
+const SEARCH_TOOL = {
+  name: "mendelu_search",
+  title: "Search the text of my course files",
+  description: 'Searches, on this computer and without asking IS anything, the text of the course files reIS has saved, in ALL subjects at once, plus every listed file\'s name, folder, date and subject. USE IT BEFORE telling the student that something is not in IS or that you cannot find it: dates (credit test, "zápočtová písemná práce", exam, defence), test topics, passing conditions, points rules, reference sheets, project briefs and deadlines are very often only written inside a course file (a harmonogram, a conditions PDF, a lecture), not in IS\'s exam list or timetable. Case and diacritics do not matter ("zapocet" finds "zápočet"). Several words must ALL be in the same file; put "a phrase in quotes" to match it exactly. A part of a word matches too ("zapoc" finds "zápočtový"). Each hit gives the subject, the file, its date modified, a snippet with the matching words in **bold**, the line, and a `storedPath`. It only finds what is saved. The answer says how many files have no searchable text yet (not read, or a scan); those were searched by name only, so when nothing fits, open the likely ones with mendelu_read_file (pass the `readWith` of a hit, or a `downloadUrl` from mendelu_subject_files) before saying IS has no answer. A hit marked `stale` was replaced in IS after its text was saved: re-read it with mendelu_read_file. Quote the snippet and name the file when you answer. Read-only.',
+  input: {
+    query: string().min(1).max(300).describe(
+      'Words to find, e.g. zápočtový test. All words must be in the file; "quoted words" match as a phrase.'
+    ),
+    subject: string().min(2).max(30).optional().describe('Only this subject code, e.g. "EBC-PE". Default: every subject.')
+  }
+};
+const BUDGET$1 = 19e3;
+const MAX_HITS = 20;
+function score(doc, terms, text2) {
+  const names2 = foldPlain([doc.title, doc.file].filter(Boolean).join(" "));
+  const meta = foldPlain(
+    [doc.code, doc.subjectName, doc.folder, doc.modified && `modified ${doc.modified}`, doc.date].filter(Boolean).join(" ")
+  );
+  let nameHits = 0;
+  let bodyOccurrences = 0;
+  let inText = false;
+  for (const t of terms) {
+    const inName = names2.includes(t);
+    const inMeta = !inName && meta.includes(t);
+    const n = text2 ? countMatches(text2, termRegex(t), 10) : 0;
+    if (!inName && !inMeta && !n) return null;
+    if (inName) nameHits++;
+    if (n) inText = true;
+    bodyOccurrences += n;
+  }
+  const close = text2 && terms.length > 1 ? spanOf(text2, terms) : null;
+  const s = nameHits * 50 + (nameHits === terms.length ? 50 : 0) + Math.min(bodyOccurrences, 10) + (close !== null && close <= 300 ? 15 : 0);
+  return { doc, score: s, inText };
+}
+const byRank = (a, b) => b.score - a.score || (a.doc.code ?? "~").localeCompare(b.doc.code ?? "~") || (a.doc.file ?? "").localeCompare(b.doc.file ?? "");
+async function runSearch(store2, args) {
+  const q = parseQuery(String(args.query ?? ""));
+  if (!q.terms.length) throw new Error("Give at least one word to search for.");
+  const only = typeof args.subject === "string" ? args.subject.trim().toLowerCase() : "";
+  const { docs } = await loadDocs(store2);
+  if (!docs.length) {
+    return {
+      query: q.display.join(" "),
+      found: 0,
+      note: "Nothing is stored yet, so there is nothing to search: no file is listed or read. Open files with mendelu_read_file (the file list comes from mendelu_subject_files) and search again."
+    };
+  }
+  const inScope = docs.filter((d) => !only || d.code?.toLowerCase() === only);
+  const withText = inScope.filter((d) => d.text).length;
+  const nameOnly = inScope.length - withText;
+  const found = inScope.map((d) => score(d, q.terms, d.text && foldPlain(d.text))).filter((s) => !!s).sort(byRank);
+  const prepared = /* @__PURE__ */ new Map();
+  const snippetOf = (doc, inText, side) => {
+    if (!inText || !doc.text) return null;
+    if (!prepared.has(doc)) prepared.set(doc, prepareSnippet(doc.text, q.terms));
+    return prepared.get(doc)?.(side) ?? null;
+  };
+  const shape2 = (side, count2) => found.slice(0, count2).map(({ doc, inText }) => {
+    const snip = snippetOf(doc, inText, side);
+    const stale = doc.readStamp && doc.listedStamp && doc.readStamp !== doc.listedStamp ? `stored text may be out of date: IS now lists this file as "${doc.listedStamp}", the text was saved when it showed "${doc.readStamp}". Read it again with mendelu_read_file.` : void 0;
+    return {
+      subject: doc.code ?? "unknown (its listing is not stored)",
+      ...doc.subjectName ? { subjectName: doc.subjectName } : {},
+      file: doc.file ?? doc.title ?? "(unnamed)",
+      ...doc.title && doc.file && doc.title !== doc.file ? { document: doc.title } : {},
+      ...doc.folder ? { folder: doc.folder } : {},
+      modified: doc.modified ?? doc.date ?? "unknown",
+      ...doc.textPath ? { storedPath: doc.textPath } : { textSaved: "no, matched by name only" },
+      ...snip ? { line: snip.line, page: snip.page, snippet: snip.snippet } : {},
+      ...stale ? { stale } : {},
+      readWith: doc.url
+    };
+  });
+  let count = Math.min(found.length, MAX_HITS);
+  let hits = shape2(SIDE, count);
+  for (const side of [120, 60, 30]) {
+    if (JSON.stringify(hits, null, 2).length <= BUDGET$1) break;
+    hits = shape2(side, count);
+  }
+  while (count > 1 && JSON.stringify(hits, null, 2).length > BUDGET$1) hits = shape2(30, --count);
+  const more = found.length - hits.length;
+  const coverage = `${withText} file${withText === 1 ? "" : "s"} with saved text searched in full${nameOnly ? `; ${nameOnly} without searchable text (not read yet, or no text in the file) searched by name only` : ""}.`;
+  return {
+    query: q.display.map((t) => /\s/.test(t) ? `"${t}"` : t).join(" "),
+    found: found.length,
+    ...more > 0 ? { note: `${more} more, narrow the query (more words, a phrase or a subject).` } : {},
+    searched: coverage,
+    ...!found.length ? {
+      note: nameOnly ? `No file matches. ${nameOnly} file${nameOnly === 1 ? " has" : "s have"} no searchable text (not read yet, or a scan): read the likely ones with mendelu_read_file before telling the student IS has no answer.` : "No saved file matches. If the student expects an answer, check mendelu_exams, mendelu_syllabus or the file list for a file not read yet."
+    } : {},
+    hits
+  };
+}
+const LEDGER_TOOL = {
+  name: "mendelu_ledger",
+  title: "The student's list of upcoming tests, defences and events",
+  description: 'The list of dated things the student has to be somewhere for: tests, credit tests, project defences, resits, programme days, events, unregistration deadlines. YOU keep it; reIS only stores it and shows it in the "upcoming" part of mendelu_overview, soonest first, with days left. WHEN TO USE: after you read a harmonogram, passing conditions, a project brief, a mail or anything else that names a date the student must act on or attend, SAVE EVERY dated event you found with action "add", one call per event, before you answer. Do not leave it only in your reply: the next conversation starts from the overview and finds it there. Also add an event the student tells you about. DO NOT add what reIS already shows: registered exam terms and open assignment deadlines come from IS by themselves. FIELDS: title (what, short), kind, date YYYY-MM-DD (Prague time), time HH:MM when the file gives one; for a stretch of days (a programme week, "in the 12th week") pass `until` as the last day. code = subject code. room, length_minutes, points, rule (minimum points, no aids), unregister_by (the last day to unregister), depends_on (what needs it, e.g. a programme that needs this test passed). source_kind says where it came from: is, course_file, mail, calendar or student. For a course_file ALWAYS pass source_url (the file\'s `url` from the overview) and source_modified (its `modified`) and source_file (its name): that is how reIS notices the file was replaced later and marks the entry "recheck". STATED OR INFERRED: basis "stated" when the file names the date. When you worked it out (the "12th week" is 14-18 December), pass basis "inferred" and inferred_how; the overview then tells the student to confirm it with the teacher. Never present an inferred date as certain. OTHER ACTIONS: "list" shows the saved events, soonest first (past ones only with include_past, one entry with id, and a replaced source file shows as recheck); a long list is cut and says which offset to pass next; "update" changes the fields you pass for an id (an empty string clears one; pass source_modified to say you rechecked the file); "remove" deletes one. Adding the same event twice updates it, it does not duplicate. It changes nothing in IS and nothing in the student\'s calendar.',
+  input: {
+    action: _enum$2(["list", "add", "update", "remove"]).describe("What to do."),
+    id: string().max(20).optional().describe("update, remove: the event id (ev-…) from list or add. list: only that entry."),
+    title: string().max(120).optional().describe('add: what it is, short, e.g. "Zápočtový test 1".'),
+    kind: _enum$2(KINDS).optional().describe("add: the kind of event."),
+    code: string().max(30).optional().describe("Subject code, e.g. EBC-PE. Leave out for an event without a subject."),
+    date: string().max(10).optional().describe("YYYY-MM-DD, Prague time. The first day when `until` is given."),
+    time: string().max(5).optional().describe("HH:MM, 24-hour, only when the source gives a time."),
+    until: string().max(10).optional().describe("YYYY-MM-DD: the last day, for a window of days (at most 60)."),
+    length_minutes: number().int().min(1).max(1440).optional().describe("How long it lasts, in minutes."),
+    room: string().max(60).optional(),
+    points: string().max(40).optional().describe("Points it is worth, as the source states them."),
+    rule: string().max(500).optional().describe("The rule that matters: minimum points, no aids, bring a laptop."),
+    unregister_by: string().max(16).optional().describe("Last day to unregister: YYYY-MM-DD or YYYY-MM-DD HH:MM."),
+    depends_on: string().max(300).optional().describe("What depends on this, when the source says."),
+    attendance: boolean().optional().describe(
+      "Whether the student must be there in person. Default: yes for tests, defences and programme days."
+    ),
+    source_kind: _enum$2(SOURCES).optional().describe("add: where the date came from."),
+    source_file: string().max(200).optional().describe("The file's name."),
+    source_url: string().max(600).optional().describe("A course file's `url` from the overview (so a replaced file is noticed)."),
+    source_modified: string().max(40).optional().describe("The file's `modified` date from the overview, as it was when you read it."),
+    basis: _enum$2(["stated", "inferred"]).optional().describe('Default stated. "inferred" needs inferred_how.'),
+    inferred_how: string().max(300).optional().describe("How an inferred date was worked out."),
+    subject: string().max(30).optional().describe("list: only this subject code."),
+    include_past: boolean().optional().describe("list: also events already past."),
+    offset: number().int().min(0).optional().describe(
+      "list: skip this many events (soonest first). A long list says which offset to pass next."
+    ),
+    limit: number().int().min(1).max(200).optional().describe(
+      "list: at most this many events. Fewer come back when the answer would be too long."
+    )
+  }
+};
+const BUDGET = 19e3;
+const day = (now) => now.toLocaleDateString("en-CA", { timeZone: "Europe/Prague" });
+function shape$1(e, now, listings) {
+  const { start: start2, end: end2 } = daysLeftOf(e, now);
+  const recheck = recheckReason(e, listings);
+  const confirm = confirmNote(e);
+  const { savedAt: _s, updatedAt: _u, ...saved } = e;
+  return {
+    ...saved,
+    when: whenOf(e),
+    ...end2 < 0 ? { status: "past" } : { daysLeft: Math.max(0, start2) },
+    ...recheck ? { recheck } : {},
+    ...confirm ? { confirm } : {}
+  };
+}
+async function withSource(store2, args) {
+  const url2 = args.source_url;
+  if (typeof url2 !== "string" || !url2) return args;
+  const f = findListed(await storedListings(store2), url2);
+  const read = args.source_modified ? void 0 : await readVersion(store2, url2);
+  return {
+    ...args,
+    source_modified: args.source_modified ?? read ?? (f ? listedDate(f) || void 0 : void 0),
+    source_file: args.source_file ?? (f ? f.file || f.name || void 0 : void 0)
+  };
+}
+async function runLedger(store2, args, now = /* @__PURE__ */ new Date()) {
+  const ledger = createLedger(store2, () => now.getTime());
+  const today = day(now);
+  try {
+    switch (args.action) {
+      case "add": {
+        const asked = ledger.askedUnder();
+        const { entry, created } = await ledger.add(await withSource(store2, args), today, asked);
+        return {
+          saved: created ? "added" : "updated: this event was already saved, so it was not added twice",
+          entry: shape$1(entry, now, {})
+        };
+      }
+      case "update": {
+        const asked = ledger.askedUnder();
+        const sourced = await withSource(store2, args);
+        const entry = await ledger.update(String(args.id ?? ""), sourced, asked);
+        return { saved: "updated", entry: shape$1(entry, now, {}) };
+      }
+      case "remove": {
+        const had = await ledger.remove(String(args.id ?? ""));
+        return { removed: had ? args.id : `nothing: no entry ${String(args.id)}` };
+      }
+      case "list":
+        return await list(store2, ledger, args, now);
+      default:
+        throw new LedgerInputError("action must be list, add, update or remove.");
+    }
+  } catch (e) {
+    if (e instanceof LedgerInputError) throw new Error(e.message);
+    throw e;
+  }
+}
+async function list(store2, ledger, args, now) {
+  const { entries: entries2, unreadable } = await ledger.list();
+  const listings = await storedListings(store2);
+  const id2 = typeof args.id === "string" ? args.id : "";
+  const only = typeof args.subject === "string" ? args.subject.trim().toUpperCase() : "";
+  const inScope = entries2.filter((e) => id2 ? e.id === id2 : !only || e.code === only);
+  const live = inScope.filter((e) => daysLeftOf(e, now).end >= 0);
+  const matching = args.include_past === true || id2 ? inScope : live;
+  const from = Math.min(Math.max(0, Math.trunc(Number(args.offset) || 0)), matching.length);
+  const asked = Math.trunc(Number(args.limit) || 0);
+  const page = matching.slice(from, asked > 0 ? from + asked : void 0);
+  const rows2 = page.map((e) => shape$1(e, now, listings));
+  let count = rows2.length;
+  while (count > 1 && JSON.stringify(rows2.slice(0, count), null, 2).length > BUDGET) count--;
+  const hidden = inScope.length - live.length;
+  const next = from + count;
+  return {
+    count: matching.length,
+    ...next < matching.length ? {
+      note: `Showing ${from + 1}-${next} of ${matching.length}. Pass offset ${next} for the next ones (subject narrows the list, id gives one entry).`
+    } : {},
+    ...args.include_past !== true && !id2 && hidden > 0 ? { pastHidden: `${hidden} past event(s) not shown: pass include_past to see them.` } : {},
+    ...unreadable ? {
+      unreadable: `${unreadable} saved file(s) in the ledger could not be read and are ignored.`
+    } : {},
+    entries: rows2.slice(0, count)
+  };
+}
 const READ_ONLY = {
   readOnlyHint: true,
   destructiveHint: false,
   idempotentHint: true,
   openWorldHint: true
 };
+const OVERVIEW = { ...READ_ONLY, idempotentHint: false };
+const FORGET = {
+  readOnlyHint: false,
+  destructiveHint: true,
+  idempotentHint: true,
+  openWorldHint: false
+};
+const SEARCH = {
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: false
+};
+const BUILD = {
+  readOnlyHint: false,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: true
+};
+const REFRESH = { ...BUILD, idempotentHint: false };
 const responseFormat = _enum$2(["markdown", "json"]).default("markdown").describe('"markdown" (default) for a readable summary, "json" for the raw data.');
-function registerTools(server2, ctx) {
+const LEDGER = {
+  readOnlyHint: false,
+  destructiveHint: true,
+  idempotentHint: false,
+  openWorldHint: false
+};
+function withNotice(r2, ctx, store2) {
+  const folder = store2?.notice();
+  const lines = [
+    ctx.updateNotice?.(),
+    folder && // The code only (EACCES): a message can carry a path with the account name.
+    `reIS could not save to its folder this session (${/^[A-Z0-9_]+$/.test(folder.reason) ? folder.reason : "unexpected error"}), so it is working from memory only.`
+  ].filter(Boolean);
+  return lines.length ? { ...r2, content: [...r2.content, { type: "text", text: lines.join("\n") }] } : r2;
+}
+function registerStoreTools(server2, ctx, store2, { clear }) {
+  const format2 = (args) => args.response_format === "json" ? "json" : "markdown";
+  const answer = async (name2, args, run) => {
+    let result2;
+    try {
+      result2 = toolResult(await run(), format2(args));
+    } catch (e) {
+      result2 = toError(name2, e);
+    }
+    return withNotice(result2, ctx, store2);
+  };
+  server2.registerTool(
+    FORGET_TOOL.name,
+    {
+      title: FORGET_TOOL.title,
+      description: FORGET_TOOL.description,
+      inputSchema: { response_format: responseFormat },
+      annotations: FORGET
+    },
+    (args) => answer(FORGET_TOOL.name, args, () => forgetEverything(store2, clear))
+  );
+  server2.registerTool(
+    SEARCH_TOOL.name,
+    {
+      title: SEARCH_TOOL.title,
+      description: SEARCH_TOOL.description,
+      inputSchema: { ...SEARCH_TOOL.input, response_format: responseFormat },
+      annotations: SEARCH
+    },
+    (args) => answer(SEARCH_TOOL.name, args, () => runSearch(store2, args))
+  );
+  server2.registerTool(
+    LEDGER_TOOL.name,
+    {
+      title: LEDGER_TOOL.title,
+      description: LEDGER_TOOL.description,
+      inputSchema: { ...LEDGER_TOOL.input, response_format: responseFormat },
+      annotations: LEDGER
+    },
+    (args) => answer(LEDGER_TOOL.name, args, () => runLedger(store2, args))
+  );
+}
+async function pool(items2, n, work) {
+  let next = 0;
+  const worker = async () => {
+    while (next < items2.length) await work(items2[next++]);
+  };
+  await Promise.all(Array.from({ length: Math.min(n, items2.length) }, worker));
+}
+async function plan(d) {
+  const data2 = await subjectsData(d.ctx);
+  const originals = createOriginals(d.store);
+  const planned = [];
+  const problems = [];
+  await pool(Object.entries(data2), 4, async ([code2, s]) => {
+    if (typeof s.folderUrl !== "string") return;
+    const folderUrl = s.folderUrl;
+    let files2;
+    try {
+      files2 = await d.run(
+        "mendelu_subject_files",
+        { code: code2 },
+        () => listFolderFiles(folderUrl)
+      );
+    } catch (e) {
+      problems.push(
+        `files of ${code2}: ${(e instanceof Error ? e.message : String(e)).slice(0, 120)}`
+      );
+      return;
+    }
+    for (const f of files2) {
+      const stamp = stampOf(f);
+      planned.push({ code: code2, file: f, stamp, kept: !!await originals.kept(f.downloadUrl, stamp) });
+    }
+  });
+  planned.sort((a, b) => a.code.localeCompare(b.code));
+  return { planned, problems, codes: Object.keys(data2).sort() };
+}
+const LISTED = 25;
+const GB = 1024 ** 3;
+const MB$1 = 1024 ** 2;
+const size$1 = (b) => b >= GB ? `${(b / GB).toFixed(1)} GB` : `${(b / MB$1).toFixed(1)} MB`;
+function capped(items2, key, moreKey, what) {
+  if (!items2.length) return {};
+  return {
+    [key]: items2.slice(0, LISTED),
+    ...items2.length > LISTED ? { [moreKey]: `${items2.length - LISTED} ${what}` } : {}
+  };
+}
+const typeOf = (f) => /\.([A-Za-z0-9]{1,10})$/.exec(f.file ?? "")?.[1]?.toLowerCase() ?? "no extension";
+const labelOf = (f) => f.file || f.name;
+function bySubject(planned, codes = []) {
+  const out = new Map(codes.map((c) => [c, []]));
+  for (const p of planned) out.set(p.code, [...out.get(p.code) ?? [], p]);
+  return out;
+}
+const typeLine = (rows2) => {
+  if (!rows2.length) return "no files";
+  const counts = /* @__PURE__ */ new Map();
+  for (const p of rows2) counts.set(typeOf(p.file), (counts.get(typeOf(p.file)) ?? 0) + 1);
+  return [...counts].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([t, n]) => `${t} ${n}`).join(", ");
+};
+function dryReport(planned, problems, budget, codes = []) {
+  const saved = planned.filter((p) => p.kept).length;
+  return {
+    dryRun: true,
+    note: "Nothing was downloaded. IS lists no file sizes, so the total size is UNKNOWN until the files are downloaded, and reIS makes no extra requests to learn it. To build the map, call mendelu_build_my_map again with dry_run: false: it downloads only the files not already saved, and stops at the byte budget.",
+    totalSize: "UNKNOWN (IS lists no sizes)",
+    files: planned.length,
+    alreadySaved: saved,
+    toDownload: planned.length - saved,
+    budget: `${size$1(budget.used)} used of ${size$1(budget.max)}`,
+    ...capped(
+      [...bySubject(planned, codes)].map(([code2, rows2]) => ({
+        code: code2,
+        files: rows2.length,
+        alreadySaved: rows2.filter((p) => p.kept).length,
+        types: typeLine(rows2)
+      })),
+      "subjects",
+      "moreSubjects",
+      "more subjects, counted in the totals above"
+    ),
+    ...capped(problems, "problems", "moreProblems", "more problems")
+  };
+}
+function buildReport(planned, outcomes, problems, codes, run) {
+  const state2 = (p) => outcomes.get(p)?.state ?? "kept";
+  const count = (rows2, s) => rows2.filter((p) => state2(p) === s).length;
+  const listOf = (s) => planned.filter((p) => state2(p) === s).map((p) => {
+    const o = outcomes.get(p);
+    return { code: p.code, file: labelOf(p.file), reason: o.reason };
+  });
+  const skipped = listOf("skipped");
+  const failed = listOf("failed");
+  const textSaved = planned.filter((p) => {
+    const o = outcomes.get(p);
+    return o?.state === "downloaded" && o.text;
+  }).length;
+  const downloaded = count(planned, "downloaded");
+  const why = run.forgotten ? " It stopped because everything reIS saved was forgotten while it ran; nothing from this run was kept after that." : run.stoppedAtBudget ? ` It stopped at the byte budget (${size$1(run.max)}): the files under "skipped" were not downloaded.` : "";
+  return {
+    dryRun: false,
+    note: `Downloaded ${downloaded} file(s); ${count(planned, "kept")} were already saved and unchanged, so they were not downloaded again.${why} Saved files are listed with a localPath by mendelu_overview; they are inside the folder below.`,
+    folder: shown(run.folder),
+    downloaded,
+    alreadySaved: count(planned, "kept"),
+    textSaved,
+    skipped: skipped.length,
+    failed: failed.length,
+    stoppedAtBudget: run.stoppedAtBudget,
+    stored: `${size$1(run.used)} of ${size$1(run.max)}`,
+    ...capped(
+      [...bySubject(planned, codes)].map(([code2, rows2]) => ({
+        code: code2,
+        files: rows2.length,
+        saved: count(rows2, "kept") + count(rows2, "downloaded"),
+        downloaded: count(rows2, "downloaded"),
+        skipped: count(rows2, "skipped"),
+        failed: count(rows2, "failed")
+      })),
+      "subjects",
+      "moreSubjects",
+      "more subjects, counted in the totals above"
+    ),
+    skippedFiles: skipped.length ? skipped.slice(0, LISTED) : void 0,
+    moreSkipped: skipped.length > LISTED ? `${skipped.length - LISTED} more skipped` : void 0,
+    failedFiles: failed.length ? failed.slice(0, LISTED) : void 0,
+    moreFailed: failed.length > LISTED ? `${failed.length - LISTED} more failed; run mendelu_build_my_map again to retry them` : void 0,
+    ...capped(problems, "problems", "moreProblems", "more problems")
+  };
+}
+const RETRY_CODES = /* @__PURE__ */ new Set(["EPERM", "EBUSY", "EACCES"]);
+const DELAYS_MS = [10, 25, 60, 150, 300];
+const sleepMs = (ms) => new Promise((r2) => setTimeout(r2, ms));
+async function atomicWrite(fs, target2, data2, at, {
+  sleep = sleepMs,
+  stillValid
+} = {}) {
+  await fs.mkdir(path.dirname(target2), { recursive: true, mode: 448 });
+  const tmp = path.join(
+    path.dirname(target2),
+    `${TEMP_PREFIX}${process.pid}-${randomBytes(6).toString("hex")}`
+  );
+  try {
+    const handle = await fs.open(tmp, "w", 384);
+    try {
+      await handle.writeFile(data2);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await fs.utimes(tmp, new Date(at), new Date(at)).catch(() => {
+    });
+    for (let attempt = 0; ; attempt++) {
+      if (stillValid && !await stillValid()) {
+        await fs.rm(tmp, { force: true }).catch(() => {
+        });
+        return false;
+      }
+      try {
+        await fs.rename(tmp, target2);
+        return true;
+      } catch (e) {
+        const code2 = e.code;
+        if (!code2 || !RETRY_CODES.has(code2) || attempt >= DELAYS_MS.length) throw e;
+        await sleep(DELAYS_MS[attempt]);
+      }
+    }
+  } catch (e) {
+    await fs.rm(tmp, { force: true }).catch(() => {
+    });
+    throw e;
+  }
+}
+async function withFileLock(fs, dir, name2, fn, {
+  sleep = sleepMs,
+  pause = 25,
+  staleMs = 1e4,
+  beatMs = 2e3,
+  onStale
+} = {}) {
+  const lock = path.join(dir, `${TEMP_PREFIX}lock-${name2}`);
+  const guard = `${lock}.takeover`;
+  const token = `${process.pid}-${randomBytes(8).toString("hex")}`;
+  const contentOf = (p) => fs.readFile(p, "utf8").catch(() => null);
+  const mine = async (p) => await contentOf(p) === token;
+  const create = async (p) => {
+    const handle = await fs.open(p, "wx", 384);
+    try {
+      await handle.writeFile(token);
+    } finally {
+      await handle.close();
+    }
+  };
+  const isStale = async (p) => {
+    const st = await fs.stat(p).catch(() => null);
+    return !!st && Date.now() - st.mtimeMs > staleMs;
+  };
+  const clear = async (p) => {
+    const aside = `${p}.stale-${token}`;
+    try {
+      await fs.rename(p, aside);
+    } catch {
+      return;
+    }
+    if (!await isStale(aside)) await fs.link(aside, p).catch(() => {
+    });
+    await fs.rm(aside, { force: true }).catch(() => {
+    });
+  };
+  let held = false;
+  try {
+    await fs.mkdir(dir, { recursive: true, mode: 448 });
+    while (!held) {
+      try {
+        await create(lock);
+        held = true;
+        break;
+      } catch (e) {
+        if (e.code !== "EEXIST") throw e;
+      }
+      if (!await isStale(lock)) {
+        await sleep(pause);
+        continue;
+      }
+      await onStale?.();
+      try {
+        await create(guard);
+      } catch (e) {
+        if (e.code !== "EEXIST") throw e;
+        if (await isStale(guard)) await clear(guard);
+        else await sleep(pause);
+        continue;
+      }
+      try {
+        if (await isStale(lock)) await clear(lock);
+      } finally {
+        if (await mine(guard)) await fs.rm(guard, { force: true }).catch(() => {
+        });
+      }
+    }
+  } catch {
+  }
+  const beat = held ? setInterval(() => {
+    void mine(lock).then(
+      (ok) => ok ? fs.utimes(lock, /* @__PURE__ */ new Date(), /* @__PURE__ */ new Date()).catch(() => {
+      }) : void 0
+    );
+  }, beatMs) : void 0;
+  beat?.unref?.();
+  try {
+    return await fn();
+  } finally {
+    if (beat) clearInterval(beat);
+    if (held && await mine(lock)) await fs.rm(lock, { force: true }).catch(() => {
+    });
+  }
+}
+const FORGET_STALE_MS = 5 * 6e4;
+const FORGET_BEAT_MS = 3e4;
+async function markerIsLive(fs, abs, now) {
+  try {
+    const age = now() - (await fs.stat(abs)).mtimeMs;
+    return Math.abs(age) <= FORGET_STALE_MS;
+  } catch (e) {
+    return e.code !== "ENOENT";
+  }
+}
+async function forgetRunning(fs, dir, now) {
+  let names2;
+  try {
+    names2 = await fs.readdir(dir);
+  } catch (e) {
+    const code2 = e.code;
+    return code2 !== "ENOENT" && code2 !== "ENOTDIR" && code2 !== "EACCES";
+  }
+  for (const name2 of names2)
+    if (name2.startsWith(FORGET_PREFIX) && await markerIsLive(fs, path.join(dir, name2), now))
+      return true;
+  return false;
+}
+const isLiveMarker = async (fs, dir, name2, now) => name2.startsWith(FORGET_PREFIX) && await markerIsLive(fs, path.join(dir, name2), now);
+const FORGETTING = "forgetting";
+async function readGeneration(fs, dir, now = Date.now) {
+  let token;
+  try {
+    token = (await fs.readFile(path.join(dir, GEN_FILE), "utf8")).trim();
+  } catch (e) {
+    const code2 = e?.code;
+    token = code2 === "ENOENT" || code2 === "ENOTDIR" ? "" : null;
+  }
+  return token !== null && await forgetRunning(fs, dir, now) ? FORGETTING : token;
+}
+const isOpen = (g2) => g2 !== null && g2 !== FORGETTING;
+async function beginForget(fs, dir, now) {
+  const file = path.join(dir, `${FORGET_PREFIX}${process.pid}-${randomBytes(6).toString("hex")}`);
+  const body2 = Buffer.from(String(process.pid));
+  await atomicWrite(fs, file, body2, now());
+  let ended2 = false;
+  let queue2 = Promise.resolve();
+  const inOrder = (fn) => queue2 = queue2.then(fn, fn);
+  return {
+    /**
+     * Prove this forget() is alive. If another forget swept the marker (a long
+     * pause made it look abandoned) put it back; any other failure is not worth
+     * stopping the delete for.
+     */
+    beat: () => inOrder(async () => {
+      if (ended2) return;
+      try {
+        await fs.utimes(file, new Date(now()), new Date(now()));
+      } catch (e) {
+        if (e.code === "ENOENT")
+          await atomicWrite(fs, file, body2, now()).catch(() => {
+          });
+      }
+    }),
+    /** The deletion is over (or gave up, and said so): readers may publish again. */
+    end: () => inOrder(async () => {
+      ended2 = true;
+      await fs.rm(file, { force: true }).catch(() => {
+      });
+    })
+  };
+}
+const sameGeneration = (a, b) => isOpen(a) && a === b;
+async function bumpGeneration(fs, dir, at) {
+  const token = Buffer.from(randomBytes(8).toString("hex"));
+  await atomicWrite(fs, path.join(dir, GEN_FILE), token, at);
+}
+async function pruneEmptyDirs(fs, dir, rel) {
+  const parts2 = rel.split("/").slice(0, -1);
+  for (let n = parts2.length; n > 0; n--) {
+    try {
+      await fs.rmdir(path.join(dir, ...parts2.slice(0, n)));
+    } catch {
+      return;
+    }
+  }
+}
+const PER_PATH = /* @__PURE__ */ new Set([
+  "EEXIST",
+  "EISDIR",
+  "ENOTDIR",
+  "ENAMETOOLONG",
+  "EINVAL",
+  "ENOENT",
+  "EMFILE",
+  "ENFILE"
+]);
+async function isPerPathFailure(fs, dir, e) {
+  const code2 = e?.code;
+  if (!code2 || !PER_PATH.has(code2)) return false;
+  try {
+    await fs.mkdir(dir, { recursive: true, mode: 448 });
+    return (await fs.stat(dir)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+const MAX_ORIGINAL_BYTES = 100 * 1024 * 1024;
+const CONCURRENCY = 3;
+async function downloadPlanned(d, planned) {
+  const budget = { max: d.store.maxBytes, used: (await d.store.usage()).bytes };
+  const originals = createOriginals(d.store);
+  const bytesIn = async (dir) => (await d.store.list()).filter((e) => e.path.startsWith(`${dir}/`)).reduce((n, e) => n + e.bytes, 0);
+  const maxFile = d.maxFileBytes ?? MAX_ORIGINAL_BYTES;
+  const outcomes = /* @__PURE__ */ new Map();
+  let stop;
+  const halted = () => stop === "budget" ? "skipped: the byte budget is reached" : stop === "forgotten" ? "skipped: everything was forgotten while this ran" : "skipped: reIS lost access to its folder";
+  async function one(p) {
+    if (p.kept) return void outcomes.set(p, { state: "kept" });
+    if (!stop && (d.token?.gen ?? null) === null) stop = "folder";
+    if (!stop && !sameGeneration(await d.store.generation(), d.token.gen)) stop = "forgotten";
+    if (!stop && !d.store.persistent) stop = "folder";
+    const at = d.token?.at ?? Date.now();
+    const listed = p.file.file ?? p.file.name;
+    const recordOnly = originalCost(
+      recordOf({
+        url: p.file.downloadUrl,
+        stamp: p.stamp,
+        bytes: 0,
+        filename: listed,
+        mediaType: "x".repeat(80),
+        at
+      })
+    );
+    const dir = originalDir(p.file.downloadUrl);
+    const credit = await bytesIn(dir);
+    const room = budget.max - budget.used - recordOnly + credit;
+    if (!stop && room <= 0) stop = "budget";
+    if (stop) return void outcomes.set(p, { state: "skipped", reason: halted() });
+    const url2 = p.file.downloadUrl;
+    try {
+      assertDokServerUrl(url2);
+      const res = await d.ctx.fetch(url2);
+      if (!res.ok) throw new Error(`IS answered HTTP ${res.status} for this file.`);
+      const h = headersOf(res);
+      const limit2 = Math.min(maxFile, room);
+      let bytes;
+      try {
+        bytes = await readCapped(res, limit2);
+      } catch (e) {
+        if (!(e instanceof TooBigError)) throw e;
+        const declared = Number(res.headers.get("content-length") ?? 0);
+        if (limit2 < maxFile && declared <= maxFile) {
+          stop = "budget";
+          return void outcomes.set(p, { state: "skipped", reason: halted() });
+        }
+        const mb = Math.round(maxFile / 1024 / 1024);
+        return void outcomes.set(p, { state: "skipped", reason: `skipped: over ${mb} MB` });
+      }
+      const filename = h.filename ?? listed;
+      const cost = originalCost(
+        recordOf({ url: url2, stamp: p.stamp, bytes, filename, mediaType: h.mediaType, at })
+      );
+      if (budget.used + cost - credit > budget.max) {
+        stop = "budget";
+        return void outcomes.set(p, { state: "skipped", reason: halted() });
+      }
+      budget.used += cost - credit;
+      const saved = await originals.save({
+        url: url2,
+        stamp: p.stamp,
+        bytes,
+        filename,
+        mediaType: h.mediaType,
+        token: d.token
+      });
+      if (!saved) {
+        budget.used -= cost - credit;
+        if (!sameGeneration(await d.store.generation(), d.token.gen)) {
+          stop = "forgotten";
+          return void outcomes.set(p, { state: "skipped", reason: halted() });
+        }
+        return void outcomes.set(p, {
+          state: "failed",
+          reason: "not saved: the path is too long for this computer, or everything was forgotten"
+        });
+      }
+      const actual = await bytesIn(dir);
+      budget.used += actual - cost;
+      outcomes.set(p, { state: "downloaded", text: await keepText(p, bytes, h, filename) });
+    } catch (e) {
+      const m = (e instanceof Error ? e.message : String(e)).split("\n")[0].slice(0, 120);
+      outcomes.set(p, { state: "failed", reason: m });
+    }
+  }
+  async function keepText(p, bytes, h, filename) {
+    const ext = h.ext || extOf(filename);
+    const kind2 = readKindOf(h.type, ext);
+    if (!kind2 || kind2 === "document" && !d.extractsText) return false;
+    const cap = d.maxTextBytes ?? (kind2 === "document" ? MAX_DOCUMENT_BYTES : MAX_FILE_BYTES);
+    if (bytes.byteLength > cap) return false;
+    try {
+      const value2 = await textOfBytes(bytes, kind2, {
+        filename,
+        mediaType: h.mediaType,
+        ext
+      });
+      const size2 = recordBytes(
+        textBody(p.file.downloadUrl, p.stamp, value2),
+        d.token?.at ?? Date.now()
+      );
+      if (budget.used + size2 > budget.max) return false;
+      budget.used += size2;
+      const kept = await d.saveText(p.file.downloadUrl, value2, p.stamp).catch(() => false);
+      if (!kept) budget.used -= size2;
+      return kept;
+    } catch {
+      return false;
+    }
+  }
+  await pool(planned, d.concurrency ?? CONCURRENCY, one);
+  if (!stop && d.token?.gen && !sameGeneration(await d.store.generation(), d.token.gen))
+    stop = "forgotten";
+  return { outcomes, budget, stop };
+}
+async function buildMap(d) {
+  const { planned, problems, codes } = await plan(d);
+  if (d.dryRun) {
+    const budget2 = { max: d.store.maxBytes, used: (await d.store.usage()).bytes };
+    return dryReport(planned, problems, budget2, codes);
+  }
+  if (!d.store.persistent)
+    throw new Error(
+      "reIS cannot save to its folder on this computer right now, so nothing was downloaded. Close any program holding files in that folder and try again."
+    );
+  const { outcomes, budget, stop } = await downloadPlanned(d, planned);
+  return buildReport(planned, outcomes, problems, codes, {
+    ...budget,
+    stoppedAtBudget: stop === "budget",
+    forgotten: stop === "forgotten",
+    folder: d.store.dir
+  });
+}
+const BUILD_TOOL = {
+  name: "mendelu_build_my_map",
+  title: "Build my map: save every course file on this computer",
+  description: "Saves the original of every file in every enrolled subject's IS folder on this computer (PDFs, slides, zips as they are, data files), plus their text where this build reads it, so later questions are answered from the saved files and Claude can open them by their path (mendelu_overview lists each saved file's `localPath`). Use it the FIRST time reIS is used on this computer, or when the student asks to build, fill or download their map or all their course files. Always call it first with dry_run true (the default): that downloads nothing and reports per subject how many files there are, of which types, and how many are already saved; IS lists no file sizes, so the total size is unknown until download. Tell the student those counts, then call it with dry_run false to download. That downloads only files not already saved for the date IS shows (running it again resumes), stops at the byte budget and says what it skipped and why, and lists files that failed. It only READS from IS (no submission, no registration, nothing changed there) and writes only reIS's own folder, which mendelu_forget_everything deletes.",
+  input: {
+    dry_run: boolean().default(true).describe(
+      "true (default): count files and types per subject, download nothing. false: download."
+    )
+  }
+};
+function registerBuild(server2, ctx, store2, cache2, saveText, extractsText) {
+  server2.registerTool(
+    BUILD_TOOL.name,
+    {
+      title: BUILD_TOOL.title,
+      description: BUILD_TOOL.description,
+      inputSchema: { ...BUILD_TOOL.input, response_format: responseFormat },
+      annotations: BUILD
+    },
+    async (args) => {
+      if (ctx.unavailable)
+        return withNotice(toError(BUILD_TOOL.name, new Error(ctx.unavailable)), ctx, store2);
+      const ticket = await cache2.ticket();
+      const token = ticket.token;
+      let result2;
+      try {
+        result2 = toolResult(
+          await buildMap({
+            store: store2,
+            ctx,
+            run: (tool, a, fn) => cache2.run(tool, a, fn, ticket),
+            token: token && typeof token === "object" && "gen" in token ? token : null,
+            saveText: (url2, value2, stamp) => saveText(url2, value2, stamp, token),
+            extractsText,
+            dryRun: args.dry_run !== false
+          }),
+          args.response_format === "json" ? "json" : "markdown"
+        );
+      } catch (e) {
+        result2 = toError(BUILD_TOOL.name, e);
+      }
+      return withNotice(result2, ctx, store2);
+    }
+  );
+}
+const LINES = 40;
+const MB = 1024 ** 2;
+const size = (b) => b >= 1024 * MB ? `${(b / 1024 / MB).toFixed(1)} GB` : `${(b / MB).toFixed(1)} MB`;
+const some = (xs) => xs.length ? xs : void 0;
+const NEVER = "This refresh only read IS and wrote reIS's own folder: it sent no mail and wrote no calendar.";
+const LEVELS = [
+  { lines: LINES, upcoming: 30, recheck: 30 },
+  { lines: 20, upcoming: 15, recheck: 15 },
+  { lines: 10, upcoming: 8, recheck: 8 },
+  { lines: 5, upcoming: 4, recheck: 4 },
+  { lines: 2, upcoming: 2, recheck: 2 },
+  { lines: 0, upcoming: 0, recheck: 0 }
+];
+const HELD_KINDS = ["points", "box", "exam", "subject"];
+function build(input, rows2, omitted, lvl) {
+  const held = [];
+  const of = (kind2) => {
+    const all = input.changes.filter((c) => c.kind === kind2);
+    const shownLines = all.slice(0, lvl.lines).map((c) => c.text);
+    const left = all.length - shownLines.length;
+    if (!left) return some(shownLines);
+    if (HELD_KINDS.includes(kind2)) {
+      held.push(...all.slice(lvl.lines));
+      return [
+        ...shownLines,
+        `${left} more do not fit in this answer: the next mendelu_refresh reports them`
+      ];
+    }
+    return [...shownLines, `${left} more: see recheck, or mendelu_ledger (action list)`];
+  };
+  const allSubjects = input.changes.filter((c) => c.kind === "subject");
+  const subjectLines = allSubjects.slice(0, lvl.lines).map(
+    (c) => c.text.startsWith("New subject") ? `${c.text} (its files are not downloaded by a refresh: call mendelu_build_my_map)` : c.text
+  );
+  if (allSubjects.length > subjectLines.length) {
+    held.push(...allSubjects.slice(lvl.lines));
+    subjectLines.push(
+      `${allSubjects.length - subjectLines.length} more subject changes do not fit in this answer: the next mendelu_refresh reports them`
+    );
+  }
+  const subjects = some(subjectLines);
+  const changed = {
+    subjects,
+    files: some(rows2),
+    moreFiles: omitted ? `${omitted} more changed file(s) do not fit in this answer: the next mendelu_refresh reports the new and replaced ones again` : void 0,
+    points: of("points"),
+    assignments: of("box"),
+    exams: of("exam"),
+    ledger: of("ledger")
+  };
+  const any = Object.values(changed).some(Boolean);
+  const { downloaded, skipped, failed } = input.counts;
+  const since = typeof input.since === "string" ? input.since : void 0;
+  const head = input.first ? 'First refresh on this computer: this look is the baseline, so nothing is compared and nothing was downloaded. From the next refresh on, "changed" lists what is new since this one, and new or replaced files of subjects already known are downloaded. To save every course file now, call mendelu_build_my_map.' : `${any ? `${input.changes.length} change(s) in IS` : "Nothing changed in IS"} since ${input.borrowed ? "what mendelu_overview last reported (no earlier refresh on this computer)" : `the last refresh${since ? ` (${since})` : ""}`}. Downloaded ${downloaded} file(s)${skipped ? `, skipped ${skipped}` : ""}${failed ? `, ${failed} failed` : ""}.${input.stop === "budget" ? ` It stopped at the byte budget (${size(input.budget.max)}): skipped files come again with the next refresh.` : ""}${input.stop === "forgotten" ? " Everything reIS saved was forgotten while it ran, so nothing more was kept." : ""}`;
+  const near = input.upcoming.filter((u) => u.daysLeft <= SOON_DAYS);
+  const later = input.upcoming.length - near.length;
+  const nearLeft = Math.max(0, near.length - lvl.upcoming);
+  const recheckLeft = Math.max(0, input.recheck.length - lvl.recheck);
+  const problems = input.problems.slice(0, Math.max(lvl.lines, 3));
+  const out = {
+    note: `${head} Read new or replaced harmonogram, conditions or brief files with mendelu_read_file (pass the url) and save every date they state with mendelu_ledger. ${NEVER}`,
+    first: input.first || void 0,
+    since: input.first ? void 0 : since ?? (input.borrowed ? "last overview" : void 0),
+    changed: any ? changed : void 0,
+    ...input.counts,
+    stoppedAtBudget: input.stop === "budget",
+    stored: `${size(input.budget.used)} of ${size(input.budget.max)}`,
+    folder: shown(input.folder),
+    recheck: some(input.recheck.slice(0, lvl.recheck)),
+    moreRecheck: recheckLeft ? `${recheckLeft} more ledger entries to recheck do not fit here: mendelu_ledger (action list) lists them all` : void 0,
+    upcoming: some(near.slice(0, lvl.upcoming)),
+    moreUpcoming: nearLeft || later ? `${nearLeft} more in the next ${SOON_DAYS} days${nearLeft ? " do not fit here" : ""} and ${later} later: mendelu_ledger (action list) and mendelu_overview list them` : void 0,
+    problems: some(problems),
+    moreProblems: input.problems.length > problems.length ? `${input.problems.length - problems.length} more problems` : void 0
+  };
+  return { out, held };
+}
+function fitRefresh(input) {
+  const sizeOf2 = (o) => input.format === "json" ? JSON.stringify(o, null, 2).length : toMarkdown(o).length;
+  const small = (o) => sizeOf2(o) <= CHARACTER_LIMIT - 300;
+  const lean = (k, lvl2) => {
+    const kept = input.rows.slice(0, k);
+    const { out, held } = build(
+      input,
+      kept.map((r2) => r2.row),
+      input.rows.length - k,
+      lvl2
+    );
+    const cut2 = input.rows.slice(k).map((r2) => r2.change).filter((c) => c.url);
+    return { out, held: [...cut2, ...held] };
+  };
+  const n = input.rows.length;
+  if (small(lean(n, LEVELS[0]).out)) return lean(n, LEVELS[0]);
+  const lvl = LEVELS.find((l) => small(lean(0, l).out));
+  if (!lvl)
+    throw new Error(
+      "The refresh report does not fit in one answer even at its smallest. Nothing was recorded; try again."
+    );
+  let [lo, hi] = [0, n];
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (small(lean(mid, lvl).out)) lo = mid;
+    else hi = mid - 1;
+  }
+  return lean(lo, lvl);
+}
+function restore(next, prev, key) {
+  if (!next) return;
+  if (prev && own(prev, key)) next[key] = prev[key];
+  else delete next[key];
+}
+function holdUnreported(next, prev, held) {
+  for (const c of held) {
+    if (!c.key && c.kind !== "subject") continue;
+    const key = c.key ?? "";
+    if (c.kind === "points") restore(next.points[c.code], prev?.points[c.code], key);
+    else if (c.kind === "box") restore(next.boxes, prev?.boxes, key);
+    else if (c.kind === "exam") restore(next.exams, prev?.exams, key);
+    else if (c.kind === "subject") {
+      restore(next.subjects, prev?.subjects, c.code);
+      restore(next.files, prev?.files, c.code);
+      restore(next.points, prev?.points, c.code);
+    }
+  }
+}
+const REFRESH_RECORD = "refresh/seen.json";
+const queues = /* @__PURE__ */ new WeakMap();
+function runRefresh(d) {
+  const prior = queues.get(d.store) ?? Promise.resolve();
+  const run = prior.then(
+    () => refresh(d),
+    () => refresh(d)
+  );
+  queues.set(
+    d.store,
+    run.catch(() => {
+    })
+  );
+  return run;
+}
+const tokenOf = (t) => t && typeof t === "object" && "gen" in t && "at" in t ? t : null;
+const retry = (o) => !!o && (o.state === "failed" || o.state === "skipped" && !/^skipped: over \d+ MB/.test(o.reason));
+function outcomeText(o, known) {
+  if (!known)
+    return "not downloaded: this subject had no listing before; mendelu_build_my_map saves its files";
+  if (!o || o.state === "kept") return "already saved";
+  if (o.state === "downloaded") return "downloaded";
+  return o.state === "failed" ? `failed: ${o.reason}` : o.reason;
+}
+async function refresh(d) {
+  const now = d.now ?? /* @__PURE__ */ new Date();
+  const { prev, borrowed } = await readRecord(d.store, REFRESH_RECORD, RECORD);
+  const { g: g2, ledger, changes } = await look(d.store, d.run, d.ctx, now, prev);
+  await d.settled();
+  const listed = /* @__PURE__ */ new Map();
+  for (const l of Object.values(g2.listings)) for (const f of l ?? []) listed.set(f.downloadUrl, f);
+  const originals = createOriginals(d.store);
+  const planned = [];
+  const plannedFor = /* @__PURE__ */ new Map();
+  const known = (c) => !!prev && own(prev.files, c.code);
+  for (const c of changes) {
+    if (c.kind !== "file" || !c.url || c.what !== "new" && c.what !== "replaced") continue;
+    const f = listed.get(c.url);
+    if (!f || !known(c)) continue;
+    const stamp = stampOf(f);
+    const p = { code: c.code, file: f, stamp, kept: !!await originals.kept(c.url, stamp) };
+    planned.push(p);
+    plannedFor.set(c, p);
+  }
+  let outcomes = /* @__PURE__ */ new Map();
+  let stop;
+  let budget = { max: d.store.maxBytes, used: (await d.store.usage()).bytes };
+  if (planned.some((p) => !p.kept)) {
+    if (!d.store.persistent) {
+      stop = "folder";
+      for (const p of planned)
+        if (!p.kept)
+          outcomes.set(p, { state: "skipped", reason: "skipped: reIS cannot save to its folder" });
+    } else {
+      ({ outcomes, budget, stop } = await downloadPlanned(
+        { ...d, token: tokenOf(d.token) },
+        planned
+      ));
+    }
+  }
+  const rows2 = [];
+  for (const c of changes) {
+    if (c.kind !== "file") continue;
+    const f = c.url ? listed.get(c.url) : void 0;
+    const was = c.was ? prev?.files[c.code]?.[c.was] : void 0;
+    const p = plannedFor.get(c);
+    rows2.push({
+      change: c,
+      row: {
+        code: c.code,
+        file: f ? f.file || f.name : was?.n ?? "",
+        what: c.what ?? "new",
+        ...f ? { modified: f.modified || f.date || "" } : {},
+        ...c.url ? { url: c.url } : {},
+        ...c.what === "gone" ? {} : { outcome: outcomeText(p && outcomes.get(p), !!p) }
+      }
+    });
+  }
+  const recheck = ledger.flatMap((e) => {
+    const reason2 = recheckReason(e, g2.listings);
+    return reason2 ? [{ id: e.id, code: e.code ?? "", title: e.title, when: whenOf(e), reason: reason2 }] : [];
+  });
+  const upcoming = upcomingItems(
+    g2.boxes,
+    g2.exams,
+    now,
+    { entries: ledger, listings: g2.listings },
+    500
+  );
+  const { out, held } = fitRefresh({
+    first: !prev,
+    borrowed,
+    since: prev?.refreshedAt,
+    changes,
+    rows: rows2,
+    counts: {
+      downloaded: [...outcomes.values()].filter((o) => o.state === "downloaded").length,
+      alreadySaved: planned.filter((p) => p.kept).length,
+      skipped: [...outcomes.values()].filter((o) => o.state === "skipped").length,
+      failed: [...outcomes.values()].filter((o) => o.state === "failed").length
+    },
+    stop,
+    budget,
+    recheck,
+    upcoming: upcoming.items,
+    problems: g2.problems,
+    folder: d.store.dir,
+    format: d.format
+  });
+  const again = [...plannedFor].filter(([, p]) => retry(outcomes.get(p))).map(([c]) => c);
+  const saved = await recordLook(
+    d.store,
+    REFRESH_RECORD,
+    prev,
+    g2.world,
+    [...held, ...again],
+    d.token,
+    {
+      extra: { refreshedAt: now.toISOString() },
+      patch: (next) => holdUnreported(next, prev, held)
+    }
+  );
+  if (saved) return out;
+  return {
+    ...out,
+    checkpoint: "reIS could not save what this refresh reported, so the next refresh may report these changes again (or, on a first refresh, take the baseline again)."
+  };
+}
+const REFRESH_TOOL = {
+  name: "mendelu_refresh",
+  title: "Refresh for the digest: what changed since the last refresh",
+  description: 'For the student\'s scheduled digest routine (daily or weekly), or when the student asks what is new since their last digest or refresh. For any other school question call mendelu_overview first. One call refreshes the cheap IS listings (subjects, course file listings, points, assignments, exams, timetable), compares them with what the LAST REFRESH saw (its own record, separate from the overview\'s), downloads the new or replaced files of subjects already known within the byte budget (never a whole library: a first refresh compares with the last mendelu_overview, or only records a baseline when there was none, and a new subject\'s files wait for mendelu_build_my_map), and returns: "changed" (each changed file with its `url`, `modified` date and what happened to its download, points rows, assignment deadlines, exam terms, new subjects, ledger entries whose source file changed), "recheck" (every ledger entry whose source file was replaced or is gone), "upcoming" (the next 14 days, soonest first, with days left and `attendance: yes` for events the student must come to) and "problems" (a subject IS did not answer for is reported, not fatal). Then read each new or replaced harmonogram, conditions or brief file with mendelu_read_file and save every date it states with mendelu_ledger. It only reads IS and writes only reIS\'s own folder: it never sends mail and never writes a calendar.'
+};
+function registerRefresh(server2, ctx, store2, cache2, map, extractsText) {
+  server2.registerTool(
+    REFRESH_TOOL.name,
+    {
+      title: REFRESH_TOOL.title,
+      description: REFRESH_TOOL.description,
+      inputSchema: { response_format: responseFormat },
+      annotations: REFRESH
+    },
+    async (args) => {
+      if (ctx.unavailable)
+        return withNotice(toError(REFRESH_TOOL.name, new Error(ctx.unavailable)), ctx, store2);
+      const ticket = await cache2.ticket();
+      const format2 = args.response_format === "json" ? "json" : "markdown";
+      let result2;
+      try {
+        result2 = toolResult(
+          await runRefresh({
+            store: store2,
+            ctx: { ...ctx, noteStudy: (p) => map.saveProfile(p, ticket.token) },
+            run: (tool, a, fn) => cache2.run(tool, a, fn, ticket, { fresh: true }),
+            token: ticket.token,
+            settled: map.settled,
+            saveText: (url2, value2, stamp) => map.saveText(url2, value2, stamp, ticket.token),
+            extractsText,
+            format: format2
+          }),
+          format2
+        );
+      } catch (e) {
+        result2 = toError(REFRESH_TOOL.name, e);
+      }
+      await map.settled();
+      return withNotice(result2, ctx, store2);
+    }
+  );
+}
+const sizeOf = (o, format2) => format2 === "json" ? JSON.stringify(o, null, 2).length : toMarkdown(o).length;
+const shape = (rows2, folder, left) => ({
+  savedFiles: `Each file with a localPath is saved on this computer: its full path is ${folder} joined with its localPath.`,
+  ...left ? {
+    pathsLeftOut: `${left} more saved file(s) did not fit with their path here: mendelu_read_file answers those from the saved copy without downloading`
+  } : {},
+  files: rows2
+});
+async function withLocalPaths(store2, value2, format2) {
+  if (!Array.isArray(value2)) return value2;
+  const files2 = value2;
+  const stored = new Set((await store2.list()).map((e) => e.path));
+  const originals = createOriginals(store2);
+  const paths = [];
+  for (const f of files2) {
+    const ok = !!f.modified && stored.has(metaPath(f.downloadUrl));
+    paths.push(ok ? await originals.kept(f.downloadUrl, stampOf(f)) : void 0);
+  }
+  if (!paths.some(Boolean)) return value2;
+  const limit2 = CHARACTER_LIMIT - 300;
+  const fitsAlone = sizeOf(files2, format2) <= limit2;
+  const build2 = (withPaths, dropAuthor) => {
+    let given = 0;
+    const rows2 = files2.map((f, i) => {
+      const { author: _a2, ...rest } = f;
+      const row = dropAuthor ? rest : { ...f };
+      if (paths[i] && given < withPaths) {
+        given++;
+        row.localPath = paths[i];
+      }
+      return row;
+    });
+    const all = paths.filter(Boolean).length;
+    return shape(rows2, store2.dir, all - given);
+  };
+  const total = paths.filter(Boolean).length;
+  if (!fitsAlone) return build2(total, false);
+  for (const dropAuthor of [false, true]) {
+    const whole = build2(total, dropAuthor);
+    if (sizeOf(whole, format2) <= limit2) return whole;
+  }
+  let [lo, hi] = [0, total];
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (sizeOf(build2(mid, true), format2) <= limit2) lo = mid;
+    else hi = mid - 1;
+  }
+  return build2(lo, true);
+}
+async function runTool(t, args, ctx, cache2, ticket, store2) {
+  if (ctx.unavailable) return toError(t.name, new Error(ctx.unavailable));
+  const format2 = args.response_format === "json" ? "json" : "markdown";
+  try {
+    const value2 = await cache2.run(t.name, args, () => t.run(args, ctx), ticket);
+    return toolResult(
+      store2 && t.name === "mendelu_subject_files" ? await withLocalPaths(store2, value2, format2) : value2,
+      format2
+    );
+  } catch (e) {
+    return toError(t.name, e);
+  }
+}
+function registerTools(server2, ctx, store2) {
+  const map = store2 && createMapPersist(store2, { extractsText: EXTRACTS_TEXT });
+  const cache2 = createToolCache({ persist: map?.persist });
+  if (store2 && map) {
+    server2.registerTool(
+      OVERVIEW_TOOL.name,
+      {
+        title: OVERVIEW_TOOL.title,
+        description: OVERVIEW_TOOL.description,
+        inputSchema: { response_format: responseFormat },
+        annotations: OVERVIEW
+      },
+      async (args) => {
+        if (ctx.unavailable) {
+          return withNotice(toError(OVERVIEW_TOOL.name, new Error(ctx.unavailable)), ctx, store2);
+        }
+        const ticket = await cache2.ticket();
+        const format2 = args.response_format === "json" ? "json" : "markdown";
+        let result2;
+        try {
+          result2 = toolResult(
+            await runOverview({
+              store: store2,
+              ctx: { ...ctx, noteStudy: (p) => map.saveProfile(p, ticket.token) },
+              run: (tool, a, fn) => cache2.run(tool, a, fn, ticket, { fresh: true }),
+              token: ticket.token,
+              settled: map.settled,
+              extractsText: EXTRACTS_TEXT,
+              format: format2
+            }),
+            format2
+          );
+        } catch (e) {
+          result2 = toError(OVERVIEW_TOOL.name, e);
+        }
+        await map.settled();
+        return withNotice(result2, ctx, store2);
+      }
+    );
+  }
+  if (store2 && map) {
+    registerBuild(server2, ctx, store2, cache2, map.saveText, EXTRACTS_TEXT);
+    registerRefresh(server2, ctx, store2, cache2, map, EXTRACTS_TEXT);
+  }
   for (const t of TOOLS) {
     server2.registerTool(
       t.name,
@@ -111642,30 +115688,569 @@ function registerTools(server2, ctx) {
         annotations: READ_ONLY
       },
       async (args) => {
-        if (ctx.unavailable) return toError(t.name, new Error(ctx.unavailable));
-        try {
-          return toolResult(
-            await t.run(args, ctx),
-            args.response_format === "json" ? "json" : "markdown"
-          );
-        } catch (e) {
-          return toError(t.name, e);
-        }
+        const ticket = await cache2.ticket();
+        const toolCtx = map ? { ...ctx, noteStudy: (p) => map.saveProfile(p, ticket.token) } : ctx;
+        const result2 = await runTool(t, args, toolCtx, cache2, ticket, store2);
+        await map?.settled();
+        return withNotice(result2, ctx, store2);
       }
     );
   }
+  if (store2)
+    registerStoreTools(server2, ctx, store2, {
+      clear: () => {
+        cache2.clear();
+        map?.reset();
+      }
+    });
 }
+function startUpdateCheck(_current, _fetchImpl) {
+  return () => null;
+}
+async function untilKept(fn) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      if (e.code !== "ENOENT" || attempt >= 8) throw e;
+    }
+  }
+}
+async function forgetFolder(fs, dir, now) {
+  let setupError;
+  let marker;
+  try {
+    marker = await untilKept(() => beginForget(fs, dir, now));
+  } catch (e) {
+    if (e.code !== "ENOTDIR") throw e;
+    setupError = e;
+  }
+  const timer = setInterval(() => void marker?.beat(), FORGET_BEAT_MS);
+  timer.unref?.();
+  try {
+    try {
+      await untilKept(() => bumpGeneration(fs, dir, now()));
+    } catch (e) {
+      setupError ??= e;
+    }
+    let names2 = [];
+    try {
+      names2 = await fs.readdir(dir);
+    } catch (e) {
+      const code2 = e.code;
+      if (code2 !== "ENOENT" && code2 !== "ENOTDIR") throw e;
+    }
+    let failed;
+    for (const name2 of names2) {
+      if (name2 === GEN_FILE) continue;
+      if (await isLiveMarker(fs, dir, name2, now)) continue;
+      try {
+        await marker?.beat();
+        await fs.rm(path.join(dir, name2), {
+          recursive: true,
+          force: true,
+          maxRetries: 3,
+          retryDelay: 50
+        });
+      } catch (e) {
+        failed ??= e;
+      }
+    }
+    if (failed) throw failed;
+    if (setupError && setupError.code !== "ENOTDIR") throw setupError;
+  } finally {
+    clearInterval(timer);
+    await marker?.end();
+  }
+}
+const VERSION = 1;
+const STALE_TEMP_MS = 36e5;
+async function readIndex(fs, dir) {
+  try {
+    const raw = JSON.parse(await fs.readFile(path.join(dir, INDEX_FILE), "utf8"));
+    const o = raw;
+    if (!o || o.version !== VERSION) return null;
+    if (!o.entries || typeof o.entries !== "object" || Array.isArray(o.entries)) return null;
+    const index2 = /* @__PURE__ */ Object.create(null);
+    for (const [p, v] of Object.entries(o.entries)) {
+      const e = v;
+      if (!e || !Number.isFinite(e.bytes) || !Number.isFinite(e.at) || e.bytes < 0)
+        continue;
+      try {
+        index2[safeRelPath(p)] = { bytes: e.bytes, at: e.at };
+      } catch {
+      }
+    }
+    return index2;
+  } catch {
+    return null;
+  }
+}
+async function writeIndex(fs, dir, index2, at) {
+  const body2 = Buffer.from(JSON.stringify({ version: VERSION, entries: index2 }));
+  await atomicWrite(fs, path.join(dir, INDEX_FILE), body2, at);
+}
+async function scan(fs, dir, nowMs) {
+  const out = [];
+  const walk = async (abs, rel) => {
+    let items2;
+    try {
+      items2 = await fs.readdir(abs, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const item of items2) {
+      const childRel = rel ? `${rel}/${item.name}` : item.name;
+      const childAbs = path.join(abs, item.name);
+      if (item.isDirectory()) await walk(childAbs, childRel);
+      else if (item.isFile()) {
+        if (!rel && (item.name === INDEX_FILE || item.name === GEN_FILE || item.name.startsWith(FORGET_PREFIX)))
+          continue;
+        try {
+          const st = await fs.stat(childAbs);
+          if (item.name.startsWith(TEMP_PREFIX)) {
+            if (nowMs - st.mtimeMs > STALE_TEMP_MS) await fs.rm(childAbs, { force: true });
+          } else {
+            out.push({ path: childRel, bytes: st.size, at: st.mtimeMs });
+          }
+        } catch {
+        }
+      }
+    }
+  };
+  await walk(dir, "");
+  return out;
+}
+function toIndex(entries2) {
+  const index2 = /* @__PURE__ */ Object.create(null);
+  for (const e of entries2) index2[e.path] = { bytes: e.bytes, at: e.at };
+  return index2;
+}
+function putEntry(index2, p, bytes, at) {
+  const key = fold(p);
+  for (const other of Object.keys(index2))
+    if (other !== p && fold(other) === key) delete index2[other];
+  index2[p] = { bytes, at };
+}
+const toEntries = (index2) => Object.entries(index2).map(([p, v]) => ({ path: p, bytes: v.bytes, at: v.at })).sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+const totalBytes = (entries2) => entries2.reduce((n, e) => n + e.bytes, 0);
+const isProtected = (p) => p.startsWith("ledger/");
+const tier = (p) => p.startsWith("originals/") ? 0 : 1;
+const oldestFirst = (entries2, keep) => entries2.filter((e) => e.path !== keep && !isProtected(e.path)).sort((a, b) => tier(a.path) - tier(b.path) || a.at - b.at || (a.path < b.path ? -1 : 1));
+function pickEvictions(entries2, max, keep) {
+  let total = totalBytes(entries2);
+  const chosen = [];
+  for (const e of oldestFirst(entries2, keep)) {
+    if (total <= max) break;
+    chosen.push(e);
+    total -= e.bytes;
+  }
+  return chosen;
+}
+async function evict(fs, dir, entries2, max, keep) {
+  const removed = /* @__PURE__ */ new Set();
+  let total = totalBytes(entries2);
+  for (const e of oldestFirst(entries2, keep)) {
+    if (total <= max) break;
+    try {
+      await fs.rm(path.join(dir, ...e.path.split("/")), { force: true });
+      removed.add(e.path);
+      total -= e.bytes;
+    } catch {
+    }
+  }
+  return entries2.filter((e) => !removed.has(e.path));
+}
+function createMemory(maxBytes) {
+  const held = /* @__PURE__ */ new Map();
+  const shadowed = /* @__PURE__ */ new Set();
+  let gen = null;
+  const moved = (g2) => g2 !== null && gen !== null && g2 !== gen;
+  const entries2 = () => [...held].map(([p, v]) => ({ path: p, bytes: v.data.length, at: v.at }));
+  return {
+    maxBytes,
+    /** Something is held or hidden, so the folder's generation is worth checking. */
+    get active() {
+      return held.size > 0 || shadowed.size > 0;
+    },
+    /** A copy, so a caller cannot change what is kept. */
+    get: (p) => {
+      const v = held.get(p)?.data;
+      return v && Buffer.from(v);
+    },
+    /** Empty memory if the folder was forgotten under another generation. */
+    sync(g2) {
+      if (moved(g2)) this.clear();
+    },
+    isShadowed: (p) => shadowed.has(p),
+    /** A copy kept in memory; evicts the oldest (never `p`) to stay inside the cap. */
+    put(p, data2, at, g2) {
+      this.sync(g2);
+      gen = held.size ? g2 ?? gen : g2;
+      held.delete(p);
+      held.set(p, { data: data2, at });
+      shadowed.add(p);
+      for (const old of pickEvictions(entries2(), maxBytes, p)) held.delete(old.path);
+    },
+    /** Hide `p` from disk reads too (the disk would not delete it). */
+    hide: (p) => void shadowed.add(p),
+    delete(p, { keepHidden = false } = {}) {
+      held.delete(p);
+      if (!keepHidden) shadowed.delete(p);
+    },
+    clear() {
+      held.clear();
+      shadowed.clear();
+      gen = null;
+    },
+    /** What the disk index says, overlaid with memory, minus stale shadowed paths. */
+    overlay(disk) {
+      const merged = Object.assign(/* @__PURE__ */ Object.create(null), disk, toIndex(entries2()));
+      for (const p of shadowed) if (!held.has(p)) delete merged[p];
+      return merged;
+    }
+  };
+}
+function createReader(fs, dir, mem, sync, now) {
+  return {
+    async read(rel) {
+      const p = safeRelPath(rel);
+      await sync();
+      const held = mem.get(p);
+      if (held) return held;
+      if (mem.isShadowed(p)) return void 0;
+      try {
+        return await fs.readFile(insideDir(dir, p));
+      } catch {
+        return void 0;
+      }
+    },
+    /**
+     * Only the first `bytes` of a file, as text, so a caller that needs a record's header
+     * does not read a whole document. The cut may end inside a multi-byte character.
+     */
+    async readHead(rel, bytes) {
+      const p = safeRelPath(rel);
+      await sync();
+      const held = mem.get(p);
+      if (held) return held.subarray(0, bytes).toString("utf8");
+      if (mem.isShadowed(p)) return void 0;
+      try {
+        const handle = await fs.open(insideDir(dir, p), "r");
+        try {
+          const buf = Buffer.alloc(bytes);
+          const { bytesRead } = await handle.read(buf, 0, bytes, 0);
+          return buf.subarray(0, bytesRead).toString("utf8");
+        } finally {
+          await handle.close();
+        }
+      } catch {
+        return void 0;
+      }
+    },
+    /**
+     * The absolute path of a file that is really in the folder, for a caller that hands a path
+     * to Claude. Undefined when it is not there, or when memory holds a newer copy or hides it
+     * (the folder gave out): a path is never claimed for what only memory has.
+     */
+    async diskPath(rel) {
+      const p = safeRelPath(rel);
+      await sync();
+      if (mem.get(p) || mem.isShadowed(p)) return void 0;
+      const full = insideDir(dir, p);
+      try {
+        return (await fs.stat(full)).isFile() ? full : void 0;
+      } catch {
+        return void 0;
+      }
+    },
+    /** From the index: empty when it is missing or damaged (see rebuild). */
+    async list() {
+      await sync();
+      return toEntries(mem.overlay(await readIndex(fs, dir) ?? toIndex([])));
+    },
+    /**
+     * The files directly inside one folder, read from the folder itself, not the index: two
+     * processes committing at once can each overwrite the other's index entry, so a file that
+     * is on disk may be missing from it. What memory holds is laid over the result.
+     */
+    async listFolder(folder) {
+      await sync();
+      const found = toIndex([]);
+      try {
+        for (const item of await fs.readdir(insideDir(dir, safeRelPath(folder)), {
+          withFileTypes: true
+        }))
+          if (item.isFile() && !item.name.startsWith(TEMP_PREFIX))
+            found[`${folder}/${item.name}`] = { bytes: 0, at: 0 };
+      } catch {
+      }
+      const prefix2 = `${folder}/`;
+      return toEntries(mem.overlay(found)).filter((e) => e.path.startsWith(prefix2));
+    },
+    /** Count and size of the content files themselves, not the index. */
+    async usage() {
+      await sync();
+      const entries2 = toEntries(mem.overlay(toIndex(await scan(fs, dir, now()))));
+      return { files: entries2.length, bytes: totalBytes(entries2) };
+    }
+  };
+}
+function createDiskWriter({ fs, dir, now, maxBytes, maxPathLength, sleep, degrade }) {
+  async function commit(p, bytes, at) {
+    const index2 = await readIndex(fs, dir);
+    let entries2;
+    let scanned = false;
+    if (index2) {
+      putEntry(index2, p, bytes, at);
+      entries2 = toEntries(index2);
+    } else {
+      entries2 = await scan(fs, dir, now());
+      scanned = true;
+    }
+    if (totalBytes(entries2) > maxBytes) {
+      if (!scanned) entries2 = await scan(fs, dir, now());
+      entries2 = await evict(fs, dir, entries2, maxBytes, p);
+    }
+    await writeIndex(fs, dir, toIndex(entries2), at);
+  }
+  async function undo(p, buf) {
+    const target2 = insideDir(dir, p);
+    const current2 = await fs.readFile(target2).catch(() => null);
+    if (current2?.equals(buf)) await fs.rm(target2, { force: true }).catch(() => {
+    });
+    await fs.rm(path.join(dir, INDEX_FILE), { force: true }).catch(() => {
+    });
+    await pruneEmptyDirs(fs, dir, p);
+    await rebuild();
+  }
+  async function dropEntry(p) {
+    const g2 = await readGeneration(fs, dir, now);
+    const indexFile = path.join(dir, INDEX_FILE);
+    if (!isOpen(g2)) {
+      await fs.rm(indexFile, { force: true }).catch(() => {
+      });
+      return;
+    }
+    const index2 = await readIndex(fs, dir);
+    if (!index2 || !(p in index2)) return;
+    delete index2[p];
+    await writeIndex(fs, dir, index2, now()).catch(() => {
+    });
+    if (!sameGeneration(await readGeneration(fs, dir, now), g2))
+      await fs.rm(indexFile, { force: true }).catch(() => {
+      });
+  }
+  async function write(p, buf, g0) {
+    const at = now();
+    const forgotten = async () => !sameGeneration(await readGeneration(fs, dir, now), g0);
+    const target2 = insideDir(dir, p);
+    if (Math.max(target2.length, path.dirname(target2).length + 32) > maxPathLength) return "skipped";
+    let stored = false;
+    try {
+      stored = await atomicWrite(fs, target2, buf, at, {
+        sleep,
+        stillValid: async () => !await forgotten()
+      });
+    } catch (e) {
+      const current2 = await readGeneration(fs, dir, now);
+      const proven = isOpen(g0) && current2 !== null && current2 !== g0;
+      if (!proven) {
+        if (!await isPerPathFailure(fs, dir, e)) {
+          degrade(e);
+          return "unusable";
+        }
+      }
+    }
+    if (!stored) {
+      await pruneEmptyDirs(fs, dir, p);
+      return "skipped";
+    }
+    if (await forgotten()) {
+      await undo(p, buf);
+      return "skipped";
+    }
+    await commit(p, buf.length, at).catch(() => {
+    });
+    if (await forgotten()) {
+      await undo(p, buf);
+      return "skipped";
+    }
+    return "kept";
+  }
+  async function rebuild() {
+    const g0 = await readGeneration(fs, dir, now);
+    if (!isOpen(g0)) return;
+    const moved = async () => !sameGeneration(await readGeneration(fs, dir, now), g0);
+    const entries2 = await scan(fs, dir, now());
+    if (await moved()) return;
+    if (entries2.length) await writeIndex(fs, dir, toIndex(entries2), now()).catch(() => {
+    });
+    else await fs.rm(path.join(dir, INDEX_FILE), { force: true }).catch(() => {
+    });
+    if (await moved()) await fs.rm(path.join(dir, INDEX_FILE), { force: true }).catch(() => {
+    });
+  }
+  return { write, rebuild, dropEntry };
+}
+const DEFAULT_MAX_BYTES = 4 * 1024 ** 3;
+const MEMORY_MAX_BYTES = 128 * 1024 ** 2;
+function createStore(opts = {}) {
+  const dir = path.resolve(opts.dir ?? resolveStoreDir(opts.resolve));
+  const fs = opts.fs ?? realFs;
+  const now = opts.now ?? Date.now;
+  const maxBytes = opts.maxBytes ?? DEFAULT_MAX_BYTES;
+  const memMax = Math.min(maxBytes, MEMORY_MAX_BYTES);
+  let persistent = true;
+  let notice;
+  const mem = createMemory(memMax);
+  let chain = Promise.resolve();
+  const locked = (fn) => {
+    const run = chain.then(fn, fn);
+    chain = run.catch(() => {
+    });
+    return run;
+  };
+  let forgets = 0;
+  let forgetting = false;
+  const syncMemory = async () => {
+    if (mem.active) mem.sync(await readGeneration(fs, dir, now));
+  };
+  function degrade(e) {
+    persistent = false;
+    const code2 = e?.code;
+    notice = { persistent: false, reason: code2 ?? (e instanceof Error ? e.message : String(e)) };
+  }
+  const reader = createReader(fs, dir, mem, syncMemory, now);
+  const disk = createDiskWriter({
+    fs,
+    dir,
+    now,
+    maxBytes,
+    maxPathLength: opts.maxPathLength ?? OS_MAX_PATH,
+    sleep: opts.sleep,
+    degrade
+  });
+  return {
+    /** The folder this store uses (it may not exist until something is saved). */
+    dir,
+    /** The byte budget of the folder; a bulk download stops at it (buildMap.ts). */
+    maxBytes,
+    /** False once the folder could not be used and the store fell back to memory. */
+    get persistent() {
+      return persistent;
+    },
+    /** Returns the memory-only notice once, then undefined. */
+    notice() {
+      const n = notice;
+      notice = void 0;
+      return n;
+    },
+    /**
+     * True if kept. False if it was not stored: bigger than the budget, a name
+     * that clashes with another file's folder, or forget() ran while it wrote.
+     */
+    async write(rel, data2, opts2 = {}) {
+      const p = safeRelPath(rel);
+      const buf = Buffer.from(data2);
+      const submitted = forgets;
+      const noted = "after" in opts2 ? Promise.resolve(opts2.after ?? null) : readGeneration(fs, dir, now);
+      const queuedBehindOwnForget = forgetting;
+      return locked(async () => {
+        const g0 = "after" in opts2 || forgets === submitted && !queuedBehindOwnForget ? await noted : await readGeneration(fs, dir, now);
+        if (g0 === FORGETTING) return false;
+        if (persistent) {
+          if (buf.length > maxBytes) return false;
+          const result2 = await disk.write(p, buf, g0);
+          if (result2 === "skipped") return false;
+          if (result2 === "kept") {
+            mem.delete(p);
+            return true;
+          }
+        }
+        if (buf.length > memMax) return false;
+        mem.put(p, buf, now(), g0);
+        return true;
+      });
+    },
+    /**
+     * Runs `fn` holding a lock shared with every server process on this folder, for a change
+     * that reads several files and writes back. The store's own write and remove may be
+     * called inside it: they take only this process's lock, a different one.
+     */
+    exclusive: (name2, fn) => withFileLock(fs, dir, name2, fn),
+    /** The folder's forget token now; hand it to write({ after }) to cancel the write if forget() runs first. */
+    generation: () => readGeneration(fs, dir, now),
+    read: reader.read,
+    readHead: reader.readHead,
+    diskPath: reader.diskPath,
+    async readText(rel) {
+      return (await this.read(rel))?.toString("utf8");
+    },
+    async remove(rel) {
+      const p = safeRelPath(rel);
+      return locked(async () => {
+        mem.delete(p);
+        await fs.rm(insideDir(dir, p), { force: true }).catch(() => mem.hide(p));
+        await disk.dropEntry(p);
+      });
+    },
+    list: reader.list,
+    /** The files directly in one folder, read from the folder itself rather than the index. */
+    listFolder: reader.listFolder,
+    usage: reader.usage,
+    /** Rewrite the index from the files on disk. A folder that does not exist yet is left alone. */
+    rebuild() {
+      return locked(async () => {
+        if (!await fs.stat(dir).catch(() => null)) return;
+        await disk.rebuild();
+      });
+    },
+    /**
+     * Delete everything in the store folder (and memory). A write that began
+     * before this, in this process or another, is cancelled and cannot land
+     * afterwards. Returns what it removed, counted under the same lock as the
+     * delete (a write by another process landing during the delete is removed but
+     * not counted); throws if something could not be deleted.
+     */
+    forget() {
+      return locked(async () => {
+        await syncMemory();
+        const held = toEntries(mem.overlay(toIndex(await scan(fs, dir, now()))));
+        const removed = { files: held.length, bytes: totalBytes(held) };
+        forgets++;
+        forgetting = true;
+        try {
+          mem.clear();
+          await forgetFolder(fs, dir, now);
+        } finally {
+          forgetting = false;
+        }
+        return removed;
+      });
+    }
+  };
+}
+const version = "5.8.1";
 const user = process.env.MENDELU_USER?.trim();
 const pass = process.env.MENDELU_PASS;
 const sessionFetch = user && pass ? createIsSession({ user, pass }, nativeFetch).fetch : noLoginFetch;
 if (sessionFetch === noLoginFetch) process.stderr.write(`reIS for Claude: ${NO_LOGIN_MESSAGE}
 `);
 setSessionFetch(sessionFetch);
-const server = new McpServer({ name: "reis-mendelu", version: "0.1.3" });
-registerTools(server, {
-  fetch: sessionFetch,
-  ...sessionFetch === noLoginFetch ? { unavailable: NO_LOGIN_MESSAGE } : {}
-});
+const store = createStore();
+void store.rebuild();
+const server = new McpServer({ name: "reis-mendelu", version });
+registerTools(
+  server,
+  {
+    fetch: sessionFetch,
+    // nativeFetch: the GitHub check must never go through the IS session.
+    updateNotice: startUpdateCheck(),
+    ...sessionFetch === noLoginFetch ? { unavailable: NO_LOGIN_MESSAGE } : {}
+  },
+  store
+);
 server.connect(new StdioServerTransport()).catch((e) => {
   process.stderr.write(
     `reIS for Claude: could not start (${e instanceof Error ? e.message : String(e)}).
@@ -111785,13 +116370,13 @@ const createCapacitor = (win2) => {
     const addListener = createPluginMethodWrapper("addListener");
     const removeListener = createPluginMethodWrapper("removeListener");
     const addListenerNative = (eventName, callback) => {
-      const call = addListener({ eventName }, callback);
+      const call = addListener({ eventName }, callback).then((callbackId) => callbackId);
       const remove = async () => {
         const callbackId = await call;
-        removeListener({
+        await removeListener({
           eventName,
           callbackId
-        }, callback);
+        });
       };
       const p = new Promise((resolve2) => call.then(() => resolve2({ remove })));
       p.remove = async () => {
@@ -111943,8 +116528,8 @@ class WebPlugin {
     });
   }
 }
-const encode = (str) => encodeURIComponent(str).replace(/%(2[346B]|5E|60|7C)/g, decodeURIComponent).replace(/[()]/g, escape);
-const decode = (str) => str.replace(/(%[\dA-F]{2})+/gi, decodeURIComponent);
+const encode = (str2) => encodeURIComponent(str2).replace(/%(2[346B]|5E|60|7C)/g, decodeURIComponent).replace(/[()]/g, escape);
+const decode = (str2) => str2.replace(/(%[\dA-F]{2})+/gi, decodeURIComponent);
 class CapacitorCookiesPluginWeb extends WebPlugin {
   async getCookies() {
     const cookies = document.cookie;
@@ -111964,9 +116549,9 @@ class CapacitorCookiesPluginWeb extends WebPlugin {
       const encodedKey = encode(options2.key);
       const encodedValue = encode(options2.value);
       const expires = options2.expires ? `; expires=${options2.expires.replace("expires=", "")}` : "";
-      const path = (options2.path || "/").replace("path=", "");
+      const path2 = (options2.path || "/").replace("path=", "");
       const domain = options2.url != null && options2.url.length > 0 ? `domain=${options2.url}` : "";
-      document.cookie = `${encodedKey}=${encodedValue || ""}${expires}; path=${path}; ${domain};`;
+      document.cookie = `${encodedKey}=${encodedValue || ""}${expires}; path=${path2}; ${domain};`;
     } catch (error2) {
       return Promise.reject(error2);
     }
@@ -112026,8 +116611,8 @@ const buildUrlParams = (params, shouldEncode = true) => {
     let item;
     if (Array.isArray(value2)) {
       item = "";
-      value2.forEach((str) => {
-        encodedValue = shouldEncode ? encodeURIComponent(str) : str;
+      value2.forEach((str2) => {
+        encodedValue = shouldEncode ? encodeURIComponent(str2) : str2;
         item += `${key}=${encodedValue}&`;
       });
       item.slice(0, -1);
